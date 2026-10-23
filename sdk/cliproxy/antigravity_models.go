@@ -642,7 +642,54 @@ func (s *Service) antigravityHomeEnabled() bool {
 	return s.cfg != nil && s.cfg.Home.Enabled
 }
 
+// antigravityTieredModelBases maps a tier-suffixed catalog entry to the sibling
+// tiers Antigravity exposes as separate upstream model IDs.
+var antigravityTieredModelBases = map[string][]string{
+	"gemini-3.8-flash-high": {"low", "medium", "tiered"},
+}
+
+// expandAntigravityTierModels adds catalog entries for tier IDs the account
+// declares upstream but the catalog lacks, so the catalog-to-hints intersection
+// does not hide them.
+func expandAntigravityTierModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+	present := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model != nil {
+			present[normalizeAntigravityFetchedModelID(model.ID)] = struct{}{}
+		}
+	}
+	expanded := models
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		tiers, ok := antigravityTieredModelBases[normalizeAntigravityFetchedModelID(model.ID)]
+		if !ok {
+			continue
+		}
+		base := strings.TrimSuffix(model.ID, "-high")
+		for _, tier := range tiers {
+			id := base + "-" + tier
+			key := normalizeAntigravityFetchedModelID(id)
+			if _, exists := present[key]; exists {
+				continue
+			}
+			if _, declared := hints.ModelIDs[key]; !declared {
+				continue
+			}
+			clone := *model
+			clone.ID = id
+			clone.Name = id
+			clone.Description = strings.TrimSuffix(model.Description, "(High)") + "(" + strings.ToUpper(tier[:1]) + tier[1:] + ")"
+			expanded = append(expanded, &clone)
+			present[key] = struct{}{}
+		}
+	}
+	return expanded
+}
+
 func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+	models = expandAntigravityTierModels(models, hints)
 	filtered := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model != nil {
