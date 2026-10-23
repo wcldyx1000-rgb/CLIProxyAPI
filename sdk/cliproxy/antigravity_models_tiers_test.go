@@ -15,8 +15,13 @@ func TestFilterAntigravityModelsExposesDeclaredTiers(t *testing.T) {
 	for _, m := range got {
 		ids[m.ID] = m.Description
 	}
-	if len(ids) != 3 {
-		t.Fatalf("got %v, want high/low/medium", ids)
+	for _, want := range []string{"gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash"} {
+		if _, ok := ids[want]; !ok {
+			t.Fatalf("missing %s in %v", want, ids)
+		}
+	}
+	if len(ids) != 4 {
+		t.Fatalf("got %v, want 4 models", ids)
 	}
 	if ids["gemini-3.8-flash-low"] != "Gemini 3.8 Flash (Low)" {
 		t.Fatalf("low description = %q", ids["gemini-3.8-flash-low"])
@@ -26,5 +31,12 @@ func TestFilterAntigravityModelsExposesDeclaredTiers(t *testing.T) {
 	}
 	if len(catalog) != 1 {
 		t.Fatal("catalog slice must not be mutated")
+	}
+}
+
+func TestAddAntigravityTierFamilyModelsKeepsOthers(t *testing.T) {
+	models := []*ModelInfo{{ID: "gemini-3-flash"}}
+	if got := addAntigravityTierFamilyModels(models); len(got) != 1 {
+		t.Fatalf("got %d models, want 1 when no tier template exists", len(got))
 	}
 }

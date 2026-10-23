@@ -29,6 +29,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		return nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 	}
 
+	// A tiered family ID (e.g. gemini-3.8-flash) is routed to the upstream tier ID
+	// that matches the thinking level already applied to the payload.
+	modelName = registry.ResolveAntigravityTierModel(modelName, payload)
+
 	base := strings.TrimSuffix(baseURL, "/")
 	if base == "" {
 		base = resolveAntigravityRequestBaseURL(auth)
