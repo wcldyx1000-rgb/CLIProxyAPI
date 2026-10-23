@@ -142,7 +142,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 				return true
 			}
 		} else {
-			models = addAntigravityTierFamilyModels(registry.GetAntigravityModels())
+			models = collapseAntigravityTierModels(registry.GetAntigravityModels())
 		}
 		models = applyExcludedModels(models, excluded)
 	case "claude":

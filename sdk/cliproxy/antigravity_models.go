@@ -642,58 +642,24 @@ func (s *Service) antigravityHomeEnabled() bool {
 	return s.cfg != nil && s.cfg.Home.Enabled
 }
 
-// expandAntigravityTierModels adds catalog entries for tier IDs the account
-// declares upstream but the catalog lacks, so the catalog-to-hints intersection
-// does not hide them. The -high entry is the template for the missing tiers.
-func expandAntigravityTierModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+// collapseAntigravityTierModels replaces the per-tier IDs of a tiered family
+// (e.g. gemini-3.8-flash-low/-medium/-high/-tiered) with the single family ID.
+// The executor routes the family ID to the upstream tier that matches the
+// request's thinking level, so clients pick the level dynamically.
+func collapseAntigravityTierModels(models []*ModelInfo) []*ModelInfo {
+	tierIDs := make(map[string]struct{})
 	present := make(map[string]struct{}, len(models))
 	for _, model := range models {
 		if model != nil {
 			present[normalizeAntigravityFetchedModelID(model.ID)] = struct{}{}
 		}
 	}
-	expanded := models
+	collapsed := make([]*ModelInfo, 0, len(models))
+	var families []*ModelInfo
 	for _, family := range registry.AntigravityTierFamilies() {
-		var template *ModelInfo
-		for _, model := range models {
-			if model != nil && normalizeAntigravityFetchedModelID(model.ID) == family+"-"+registry.AntigravityTierDefaultSuffix {
-				template = model
-				break
-			}
-		}
-		if template == nil {
-			continue
-		}
 		for _, tier := range registry.AntigravityTierSuffixes {
-			id := family + "-" + tier
-			if _, exists := present[id]; exists {
-				continue
-			}
-			if _, declared := hints.ModelIDs[id]; !declared {
-				continue
-			}
-			clone := *template
-			clone.ID = id
-			clone.Name = id
-			clone.Description = strings.TrimSuffix(template.Description, "(High)") + "(" + strings.ToUpper(tier[:1]) + tier[1:] + ")"
-			expanded = append(expanded, &clone)
-			present[id] = struct{}{}
+			tierIDs[family+"-"+tier] = struct{}{}
 		}
-	}
-	return expanded
-}
-
-// addAntigravityTierFamilyModels adds the single family ID (e.g. gemini-3.8-flash)
-// next to its tier IDs. The executor routes it to the tier that matches the
-// request's thinking level, so clients can pick the level dynamically.
-func addAntigravityTierFamilyModels(models []*ModelInfo) []*ModelInfo {
-	present := make(map[string]struct{}, len(models))
-	for _, model := range models {
-		if model != nil {
-			present[normalizeAntigravityFetchedModelID(model.ID)] = struct{}{}
-		}
-	}
-	for _, family := range registry.AntigravityTierFamilies() {
 		if _, exists := present[family]; exists {
 			continue
 		}
@@ -705,15 +671,23 @@ func addAntigravityTierFamilyModels(models []*ModelInfo) []*ModelInfo {
 			clone.ID = family
 			clone.Name = family
 			clone.Description = strings.TrimSuffix(model.Description, " (High)")
-			models = append(models, &clone)
+			families = append(families, &clone)
 			break
 		}
 	}
-	return models
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if _, hidden := tierIDs[normalizeAntigravityFetchedModelID(model.ID)]; hidden {
+			continue
+		}
+		collapsed = append(collapsed, model)
+	}
+	return append(collapsed, families...)
 }
 
 func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	models = expandAntigravityTierModels(models, hints)
 	filtered := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model != nil {
@@ -722,7 +696,7 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
 			}
 		}
 	}
-	return addAntigravityTierFamilyModels(filtered)
+	return collapseAntigravityTierModels(filtered)
 }
 
 func (s *Service) antigravityModelsForHints(auth *coreauth.Auth, hints antigravityModelCapabilityHints) []*ModelInfo {

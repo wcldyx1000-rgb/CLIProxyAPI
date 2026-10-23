@@ -2,12 +2,16 @@ package cliproxy
 
 import "testing"
 
-func TestFilterAntigravityModelsExposesDeclaredTiers(t *testing.T) {
-	catalog := []*ModelInfo{{ID: "gemini-3.8-flash-high", Name: "gemini-3.8-flash-high", Description: "Gemini 3.8 Flash (High)"}}
+func TestFilterAntigravityModelsCollapsesTiersIntoFamily(t *testing.T) {
+	catalog := []*ModelInfo{
+		{ID: "gemini-3.8-flash-high", Name: "gemini-3.8-flash-high", Description: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3-flash", Name: "gemini-3-flash"},
+	}
 	hints := antigravityModelCapabilityHints{ModelIDs: map[string]struct{}{
 		"gemini-3.8-flash-high":   {},
 		"gemini-3.8-flash-low":    {},
 		"gemini-3.8-flash-medium": {},
+		"gemini-3-flash":          {},
 	}}
 
 	got := filterAntigravityModels(catalog, hints)
@@ -15,28 +19,23 @@ func TestFilterAntigravityModelsExposesDeclaredTiers(t *testing.T) {
 	for _, m := range got {
 		ids[m.ID] = m.Description
 	}
-	for _, want := range []string{"gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash"} {
-		if _, ok := ids[want]; !ok {
-			t.Fatalf("missing %s in %v", want, ids)
-		}
+	if len(ids) != 2 {
+		t.Fatalf("got %v, want gemini-3.8-flash and gemini-3-flash only", ids)
 	}
-	if len(ids) != 4 {
-		t.Fatalf("got %v, want 4 models", ids)
+	if desc, ok := ids["gemini-3.8-flash"]; !ok || desc != "Gemini 3.8 Flash" {
+		t.Fatalf("family model missing or wrong description: %v", ids)
 	}
-	if ids["gemini-3.8-flash-low"] != "Gemini 3.8 Flash (Low)" {
-		t.Fatalf("low description = %q", ids["gemini-3.8-flash-low"])
+	if _, ok := ids["gemini-3-flash"]; !ok {
+		t.Fatal("unrelated model must be kept")
 	}
-	if _, ok := ids["gemini-3.8-flash-tiered"]; ok {
-		t.Fatal("tiered must not appear when upstream does not declare it")
-	}
-	if len(catalog) != 1 {
+	if len(catalog) != 2 {
 		t.Fatal("catalog slice must not be mutated")
 	}
 }
 
-func TestAddAntigravityTierFamilyModelsKeepsOthers(t *testing.T) {
+func TestCollapseAntigravityTierModelsKeepsOthersWithoutTemplate(t *testing.T) {
 	models := []*ModelInfo{{ID: "gemini-3-flash"}}
-	if got := addAntigravityTierFamilyModels(models); len(got) != 1 {
+	if got := collapseAntigravityTierModels(models); len(got) != 1 {
 		t.Fatalf("got %d models, want 1 when no tier template exists", len(got))
 	}
 }
