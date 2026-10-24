@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -133,7 +134,15 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		}
 	}
 	requestPayload = ensureAntigravityGeminiBoundaryUserContent(baseModel, requestPayload)
-	httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
+	var terminalSeen atomic.Bool
+	upstreamCtx, releaseUpstream := newAntigravityStreamContext(ctx, &terminalSeen)
+	streamOwnsUpstream := false
+	defer func() {
+		if !streamOwnsUpstream {
+			releaseUpstream()
+		}
+	}()
+	httpReq, errReq := e.buildRequest(upstreamCtx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 	if errReq != nil {
 		err = errReq
 		return nil, err
@@ -208,7 +217,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	replayAccumulator := newAntigravityReasoningReplayAccumulator(replayScope, requestPayload)
 	out := make(chan cliproxyexecutor.StreamChunk)
 	stopDeliverySupport := usage.SupportStreamDelivery(ctx)
+	streamOwnsUpstream = true
 	go func(resp *http.Response) {
+		defer releaseUpstream()
 		defer func() {
 			if errClose := resp.Body.Close(); errClose != nil {
 				log.Errorf("antigravity executor: close response line error: %v", errClose)
@@ -369,6 +380,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 						}
 					}
 				}
+			}
+			if isTerminalChunk {
+				terminalSeen.Store(true)
 			}
 			for i := range chunks {
 				select {
