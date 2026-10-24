@@ -1118,6 +1118,10 @@ oauth:
       #   - "API"
       #   - "proxy"
       # connection-pool:              # optional: upstream HTTP connection pool settings
+      #   # Short connections are the default because large credential pools would otherwise keep
+      #   # many idle connections open (#5494). With one or a few credentials, enabling the pool
+      #   # avoids a new TLS handshake per request, matching the official client. Idle connections
+      #   # were observed being closed upstream after about 57s, so a timeout above that buys nothing.
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)
       #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2)
