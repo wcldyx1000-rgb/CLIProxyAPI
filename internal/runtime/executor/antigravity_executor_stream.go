@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -137,6 +138,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		err = errReq
 		return nil, err
 	}
+	summary := helps.NewAntigravityRequestSummary(requestPayload)
+	upstreamModel := registry.ResolveAntigravityTierModel(baseModel, requestPayload)
+	callStart := time.Now()
 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate_stream").Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
@@ -147,6 +151,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	summary.LogFirstByte(ctx, "generate_stream", req.Model, upstreamModel, httpResp.StatusCode, callStart)
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -213,6 +218,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		scanner.Buffer(nil, streamScannerBuffer)
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var streamUsage helps.StreamUsageBuffer
+		defer func() {
+			detail, hasUsage := streamUsage.Detail()
+			summary.LogDone(ctx, "generate_stream", req.Model, upstreamModel, callStart, detail, hasUsage)
+		}()
 		var streamErr error
 		var pendingJSON []byte
 		var replayCommitted bool

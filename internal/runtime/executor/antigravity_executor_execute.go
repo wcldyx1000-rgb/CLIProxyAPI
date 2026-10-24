@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -137,6 +138,9 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		return resp, err
 	}
 
+	summary := helps.NewAntigravityRequestSummary(requestPayload)
+	upstreamModel := registry.ResolveAntigravityTierModel(baseModel, requestPayload)
+	callStart := time.Now()
 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
@@ -148,6 +152,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	summary.LogFirstByte(ctx, "generate", req.Model, upstreamModel, httpResp.StatusCode, callStart)
 	bodyBytes, errRead := io.ReadAll(httpResp.Body)
 	if errClose := httpResp.Body.Close(); errClose != nil {
 		log.Errorf("antigravity executor: close response body error: %v", errClose)
@@ -202,7 +207,9 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if helps.ApplyPatchTranslationError(param) != nil || len(converted) == 0 {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
 	}
-	reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
+	nonStreamUsage := helps.ParseAntigravityUsage(bodyBytes)
+	reporter.Publish(ctx, nonStreamUsage)
+	summary.LogDone(ctx, "generate", req.Model, upstreamModel, callStart, nonStreamUsage, true)
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		converted = helps.EnsureResponsesUsageDetails(converted)
 	}
