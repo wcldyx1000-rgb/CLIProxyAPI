@@ -18,9 +18,9 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -461,15 +461,14 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	if len(baseURLs) == 0 {
 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
 	}
-	client := &http.Client{}
-	transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyURL)
-	if errProxy != nil {
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	client := executor.NewAntigravityCatalogHTTPClient(proxyURL, cfg)
+	if client == nil {
 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
 	}
-	if transport != nil {
-		client.Transport = transport
-		defer transport.CloseIdleConnections()
-	}
+	defer client.CloseIdleConnections()
 	project, _ := auth.Metadata["project_id"].(string)
 	body, errMarshal := json.Marshal(map[string]string{"project": project})
 	if errMarshal != nil {
