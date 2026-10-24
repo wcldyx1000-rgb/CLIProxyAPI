@@ -1421,10 +1421,16 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if !isRequestRetryRoundError(err) || !m.retryAllowed(attempt, providers, model, eligibility, pinnedAuthID, defaultRequestRetry) {
 		return 0, false
 	}
+	// A transport error leaves no cooldown, so without a backoff the next round would start
+	// at once. Antigravity backs off instead (see antigravityTransientRetryWait).
+	transientBackoff := hasAntigravityProvider(providers) && isTransientTransportError(err)
 	wait, found := m.closestCooldownWaitWithAttempted(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry, status, attempted)
 	if found {
 		if wait > 0 && (maxWait <= 0 || wait > maxWait) {
 			return 0, false
+		}
+		if wait == 0 && transientBackoff {
+			return antigravityTransientRetryWait(attempt, maxWait, antigravityTransientRetryRandom), true
 		}
 		return wait, true
 	}
@@ -1433,6 +1439,9 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 			return 0, false
 		}
 		return *retryAfter, true
+	}
+	if transientBackoff {
+		return antigravityTransientRetryWait(attempt, maxWait, antigravityTransientRetryRandom), true
 	}
 	return 0, true
 }
