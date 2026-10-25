@@ -20,43 +20,104 @@ import (
 // decrypted traffic:
 //
 //   - requestId is agent/<cascade_id>/<unix_ms>/<trajectory_id>/<step>, where
-//     step equals the number of request.contents entries in plain chat turns
-//     (1, 3, 5, ...). Turns with tool calls were not captured, so using the
-//     contents count there is an inference.
+//     step equals the number of request.contents entries, in plain turns and in
+//     tool-call continuations alike.
 //   - request.labels carries the same conversation identifiers. Its keys are
-//     emitted in sorted order.
+//     emitted in sorted order. labels.request_id ends with the number of model
+//     outputs (text or functionCall) already in the conversation, so it grows
+//     by one per generate call; last_execution_id appears once the user has
+//     spoken more than once.
 //   - Top-level and request-level fields follow a fixed order.
 //
 // Project-scoped deterministic IDs keep one conversation's identifiers stable
 // across turns and retries without storing per-conversation state.
 
+// AntigravityCatalogModel holds the fetchAvailableModels fields the desktop
+// client copies into its generate requests.
+type AntigravityCatalogModel struct {
+	// Enum is the "model" field ("MODEL_PLACEHOLDER_M20" and similar), sent as
+	// labels.model_enum.
+	Enum string
+	// ThinkingBudget is the catalog thinkingBudget, sent as
+	// generationConfig.thinkingConfig.thinkingBudget; nil when absent.
+	ThinkingBudget *int64
+	// HasThinkingLevel reports a catalog thinkingLevel; such models are sent a
+	// level instead of a budget.
+	HasThinkingLevel bool
+	// MaxOutputTokens is sent as generationConfig.maxOutputTokens; 0 when absent.
+	MaxOutputTokens int64
+}
+
 var (
-	antigravityModelEnumsMu sync.RWMutex
-	antigravityModelEnums   = map[string]string{}
+	antigravityCatalogModelsMu sync.RWMutex
+	antigravityCatalogModels   = map[string]AntigravityCatalogModel{}
 )
 
-// RecordAntigravityModelEnums stores the model enum names ("MODEL_PLACEHOLDER_M20"
-// and similar) that fetchAvailableModels reports in each model's "model" field.
-// The desktop client sends the selected model's enum as labels.model_enum.
-func RecordAntigravityModelEnums(enums map[string]string) {
-	if len(enums) == 0 {
+// RecordAntigravityCatalogModels stores catalog details per model ID, replacing
+// earlier entries for the same IDs.
+func RecordAntigravityCatalogModels(models map[string]AntigravityCatalogModel) {
+	if len(models) == 0 {
 		return
 	}
-	antigravityModelEnumsMu.Lock()
-	defer antigravityModelEnumsMu.Unlock()
-	for modelID, enum := range enums {
-		modelID = strings.ToLower(strings.TrimSpace(modelID))
-		enum = strings.TrimSpace(enum)
-		if modelID != "" && enum != "" {
-			antigravityModelEnums[modelID] = enum
+	antigravityCatalogModelsMu.Lock()
+	defer antigravityCatalogModelsMu.Unlock()
+	for modelID, details := range models {
+		if modelID = strings.ToLower(strings.TrimSpace(modelID)); modelID != "" {
+			details.Enum = strings.TrimSpace(details.Enum)
+			antigravityCatalogModels[modelID] = details
 		}
 	}
 }
 
+func antigravityCatalogModel(modelName string) (AntigravityCatalogModel, bool) {
+	antigravityCatalogModelsMu.RLock()
+	defer antigravityCatalogModelsMu.RUnlock()
+	details, ok := antigravityCatalogModels[strings.ToLower(strings.TrimSpace(modelName))]
+	return details, ok
+}
+
 func antigravityModelEnum(modelName string) string {
-	antigravityModelEnumsMu.RLock()
-	defer antigravityModelEnumsMu.RUnlock()
-	return antigravityModelEnums[strings.ToLower(strings.TrimSpace(modelName))]
+	details, _ := antigravityCatalogModel(modelName)
+	return details.Enum
+}
+
+// applyAntigravityCatalogGenerationConfig fills a Gemini request's output limit
+// and thinking amount from the model catalog, as the desktop client does (it
+// sent maxOutputTokens 65536 and thinkingBudget -1 for gemini-3.8-flash-high,
+// whose catalog entry carries exactly those values and no thinkingLevel).
+//
+//   - maxOutputTokens becomes the catalog value. The service already dropped
+//     the client's own value for Gemini models, so this only adds the field.
+//   - A thinkingLevel equal to the model's tier suffix (the "medium" that
+//     selected gemini-3.8-flash-medium) is replaced by that model's catalog
+//     budget; both name the same tier. Any other level is left alone.
+//   - A request without any thinking amount gets none added. At this point an
+//     explicitly disabled request (whose thinkingConfig was removed) looks the
+//     same, and adding a budget would turn its thinking back on.
+//
+// Models without a catalog entry keep the previous behavior: no maxOutputTokens.
+func applyAntigravityCatalogGenerationConfig(payload []byte, modelName string) []byte {
+	details, ok := antigravityCatalogModel(modelName)
+	if !ok {
+		payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+		return payload
+	}
+	if details.MaxOutputTokens > 0 {
+		payload, _ = sjson.SetBytes(payload, "request.generationConfig.maxOutputTokens", details.MaxOutputTokens)
+	} else {
+		payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+	}
+	if details.ThinkingBudget == nil || details.HasThinkingLevel {
+		return payload
+	}
+	const thinkingPath = "request.generationConfig.thinkingConfig"
+	level := gjson.GetBytes(payload, thinkingPath+".thinkingLevel")
+	if level.Exists() && !gjson.GetBytes(payload, thinkingPath+".thinkingBudget").Exists() &&
+		strings.HasSuffix(strings.ToLower(modelName), "-"+strings.ToLower(level.String())) {
+		payload, _ = sjson.DeleteBytes(payload, thinkingPath+".thinkingLevel")
+		payload, _ = sjson.SetBytes(payload, thinkingPath+".thinkingBudget", *details.ThinkingBudget)
+	}
+	return payload
 }
 
 // antigravityDerivedUUID returns a version-4 formatted UUID derived from the
@@ -69,28 +130,26 @@ func antigravityDerivedUUID(parts ...string) string {
 	return id.String()
 }
 
-// antigravityUserTurnIndex counts user turns before the latest one. A user
-// content made only of functionResponse parts is a tool result, not a turn.
-func antigravityUserTurnIndex(contents gjson.Result) int {
-	turns := 0
+// antigravityCountContents counts contents with the given role, skipping tool
+// results: a content made only of functionResponse parts. The desktop client
+// sends tool results with role "model", Gemini-style requests with role "user";
+// neither is a user turn or a model output.
+func antigravityCountContents(contents gjson.Result, role string) int {
+	count := 0
 	contents.ForEach(func(_, content gjson.Result) bool {
-		if content.Get("role").String() != "user" {
+		if content.Get("role").String() != role {
 			return true
 		}
-		hasUserPart := false
 		content.Get("parts").ForEach(func(_, part gjson.Result) bool {
 			if !part.Get("functionResponse").Exists() {
-				hasUserPart = true
+				count++
 				return false
 			}
 			return true
 		})
-		if hasUserPart {
-			turns++
-		}
 		return true
 	})
-	return max(turns-1, 0)
+	return count
 }
 
 // applyAntigravityAgentEnvelope sets requestId and request.labels on an agent
@@ -98,7 +157,8 @@ func antigravityUserTurnIndex(contents gjson.Result) int {
 func applyAntigravityAgentEnvelope(payload []byte, modelName, projectID, sessionID string, now time.Time) []byte {
 	contents := gjson.GetBytes(payload, "request.contents")
 	step := max(int(contents.Get("#").Int()), 1)
-	turn := antigravityUserTurnIndex(contents)
+	turn := max(antigravityCountContents(contents, "user")-1, 0)
+	modelOutputs := antigravityCountContents(contents, "model")
 
 	cascadeID := antigravityDerivedUUID("cascade", projectID, sessionID)
 	trajectoryID := antigravityDerivedUUID("trajectory", projectID, sessionID)
@@ -110,15 +170,16 @@ func applyAntigravityAgentEnvelope(payload []byte, modelName, projectID, session
 	labels := map[string]string{
 		"cascade_id":               cascadeID,
 		"last_step_index":          strconv.Itoa(step - 1),
-		"request_id":               trajectoryID + "-" + strconv.Itoa(turn),
+		"request_id":               trajectoryID + "-" + strconv.Itoa(modelOutputs),
 		"root_cascade_id":          cascadeID,
 		"trajectory_id":            trajectoryID,
 		"used_claude":              usedClaude,
 		"used_claude_conservative": usedClaude,
 		"used_non_gemini_model":    strconv.FormatBool(!strings.HasPrefix(lowerModel, "gemini")),
 	}
-	// The client adds last_execution_id from the second turn on. Its value has no
-	// observed relation to the other IDs, so a per-turn derived ID stands in.
+	// The client adds last_execution_id from the second user turn on, including
+	// that turn's tool-call continuations. Its value has no observed relation to
+	// the other IDs, so a per-turn derived ID stands in.
 	if turn > 0 {
 		labels["last_execution_id"] = antigravityDerivedUUID("execution", projectID, sessionID, strconv.Itoa(turn-1))
 	}
@@ -156,6 +217,9 @@ func sortedStringMapJSON(values map[string]string) []byte {
 var (
 	antigravityTopLevelFieldOrder = []string{"project", "requestId", "request", "model", "userAgent", "requestType"}
 	antigravityRequestFieldOrder  = []string{"contents", "systemInstruction", "tools", "toolConfig", "labels", "generationConfig", "sessionId"}
+	// The client sends {"maxOutputTokens":…,"thinkingConfig":{"includeThoughts":…,"thinkingBudget":…}}.
+	antigravityGenerationConfigFieldOrder = []string{"maxOutputTokens", "thinkingConfig"}
+	antigravityThinkingConfigFieldOrder   = []string{"includeThoughts", "thinkingBudget", "thinkingLevel"}
 )
 
 // orderAntigravityPayload rewrites the top-level object and its request object
@@ -169,7 +233,15 @@ func orderAntigravityPayload(payload []byte) []byte {
 	request := root.Get("request")
 	var orderedRequest []byte
 	if request.IsObject() {
-		orderedRequest = orderJSONObject(request, antigravityRequestFieldOrder, nil)
+		var orderedGeneration []byte
+		if generation := request.Get("generationConfig"); generation.IsObject() {
+			var orderedThinking []byte
+			if thinkingConfig := generation.Get("thinkingConfig"); thinkingConfig.IsObject() {
+				orderedThinking = orderJSONObject(thinkingConfig, antigravityThinkingConfigFieldOrder, nil)
+			}
+			orderedGeneration = orderJSONObject(generation, antigravityGenerationConfigFieldOrder, map[string][]byte{"thinkingConfig": orderedThinking})
+		}
+		orderedRequest = orderJSONObject(request, antigravityRequestFieldOrder, map[string][]byte{"generationConfig": orderedGeneration})
 	}
 	return orderJSONObject(root, antigravityTopLevelFieldOrder, map[string][]byte{"request": orderedRequest})
 }

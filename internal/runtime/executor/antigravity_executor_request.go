@@ -71,6 +71,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 	}
 
+	// Claude requests keep the toolConfig the caller sent. The desktop client
+	// sends none for Claude (captured with the live catalog), and the forced
+	// functionCallingConfig.mode=VALIDATED used before also overrode an
+	// explicit tool_choice such as "none".
 	isClaudeModel := strings.Contains(modelName, "claude")
 	useAntigravitySchema := isClaudeModel || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
 	var (
@@ -78,26 +82,20 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadLog []byte
 	)
 	if antigravityRequestNeedsSchemaSanitization(payload) {
-		payloadStr := sanitizeAntigravityRequestSchemasForModel(string(payload), useAntigravitySchema, isClaudeModel)
-
-		if strings.Contains(modelName, "claude") {
-			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-			payloadStr = string(updated)
-		} else {
-			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+		payloadStrBytes := []byte(sanitizeAntigravityRequestSchemasForModel(string(payload), useAntigravitySchema, isClaudeModel))
+		if !isClaudeModel {
+			payloadStrBytes = applyAntigravityCatalogGenerationConfig(payloadStrBytes, modelName)
 		}
 
-		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
+		payloadStrBytes = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payloadStrBytes)
 		payloadStrBytes = orderAntigravityPayload(helps.FinalizePayload(ctx, payloadStrBytes))
 		bodyReader = bytes.NewReader(payloadStrBytes)
 		if e.cfg != nil && e.cfg.RequestLog {
 			payloadLog = append([]byte(nil), payloadStrBytes...)
 		}
 	} else {
-		if strings.Contains(modelName, "claude") {
-			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-		} else {
-			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+		if !isClaudeModel {
+			payload = applyAntigravityCatalogGenerationConfig(payload, modelName)
 		}
 
 		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)

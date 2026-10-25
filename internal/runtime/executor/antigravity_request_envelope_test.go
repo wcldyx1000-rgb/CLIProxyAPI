@@ -12,7 +12,7 @@ import (
 var antigravityAgentRequestIDPattern = regexp.MustCompile(`^agent/([0-9a-f-]{36})/(\d+)/([0-9a-f-]{36})/(\d+)$`)
 
 func TestGeminiToAntigravityAgentEnvelopeMatchesDesktopClient(t *testing.T) {
-	RecordAntigravityModelEnums(map[string]string{"Gemini-Envelope-Test": "MODEL_PLACEHOLDER_M20"})
+	RecordAntigravityCatalogModels(map[string]AntigravityCatalogModel{"Gemini-Envelope-Test": {Enum: "MODEL_PLACEHOLDER_M20"}})
 	now := time.UnixMilli(1792890907568)
 
 	turn1 := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"first"}]}]}}`)
@@ -75,12 +75,43 @@ func TestAntigravityAgentEnvelopeClaudeLabelsAndToolResults(t *testing.T) {
 			t.Fatalf("labels.%s = %q, want true for a Claude model", key, labels.Get(key).String())
 		}
 	}
-	// A tool result is not a new user turn.
-	if labels.Get("request_id").String() != labels.Get("trajectory_id").String()+"-0" {
-		t.Fatalf("request_id = %q, want turn index 0", labels.Get("request_id").String())
-	}
 	if labels.Get("model_enum").Exists() {
 		t.Fatal("model_enum must be omitted when the catalog has not reported it")
+	}
+}
+
+// The sequence below is the desktop client's captured conversation: two user
+// turns, each answered by one view_file call and a text reply. The client sends
+// tool results with role "model"; Gemini-style requests use role "user".
+func TestAntigravityAgentEnvelopeToolTurnsMatchDesktopCounts(t *testing.T) {
+	const (
+		user     = `{"role":"user","parts":[{"text":"q"}]}`
+		call     = `{"role":"model","parts":[{"functionCall":{"name":"view_file","args":{}}}]}`
+		result   = `{"role":"%s","parts":[{"functionResponse":{"name":"view_file","response":{}}}]}`
+		answered = `{"role":"model","parts":[{"text":"ok"}]}`
+	)
+	for _, resultRole := range []string{"model", "user"} {
+		toolResult := strings.Replace(result, "%s", resultRole, 1)
+		for _, tc := range []struct {
+			contents  []string
+			step      string
+			requestID string
+			execution bool
+		}{
+			{[]string{user}, "1", "0", false},
+			{[]string{user, call, toolResult}, "3", "1", false},
+			{[]string{user, call, toolResult, answered, user}, "5", "2", true},
+			{[]string{user, call, toolResult, answered, user, call, toolResult}, "7", "3", true},
+		} {
+			payload := []byte(`{"request":{"contents":[` + strings.Join(tc.contents, ",") + `]}}`)
+			out := applyAntigravityAgentEnvelope(payload, "gemini-3.8-flash-high", "proj", "-1", time.Now())
+			match := antigravityAgentRequestIDPattern.FindStringSubmatch(gjson.GetBytes(out, "requestId").String())
+			labels := gjson.GetBytes(out, "request.labels")
+			if match == nil || match[4] != tc.step || labels.Get("request_id").String() != labels.Get("trajectory_id").String()+"-"+tc.requestID || labels.Get("last_execution_id").Exists() != tc.execution {
+				t.Fatalf("result role %s, %d contents: requestId=%s labels=%s; want step %s, request_id suffix %s, last_execution_id %v",
+					resultRole, len(tc.contents), gjson.GetBytes(out, "requestId").String(), labels.Raw, tc.step, tc.requestID, tc.execution)
+			}
+		}
 	}
 }
 
@@ -95,9 +126,43 @@ func TestGeminiToAntigravityUsesAgentEnvelopeOnlyForAgentRequests(t *testing.T) 
 	}
 }
 
+func TestApplyAntigravityCatalogGenerationConfig(t *testing.T) {
+	budget := func(v int64) *int64 { return &v }
+	// Values from the live catalog captured on 2026-10-25.
+	RecordAntigravityCatalogModels(map[string]AntigravityCatalogModel{
+		"catalog-test-gemini-3.8-flash-medium": {ThinkingBudget: budget(4000), MaxOutputTokens: 65536},
+		"catalog-test-gemini-3.5-flash-lite":   {HasThinkingLevel: true, MaxOutputTokens: 65535},
+	})
+	for _, tc := range []struct {
+		name, model, in, want string
+	}{
+		{"tier level becomes catalog budget", "catalog-test-gemini-3.8-flash-medium",
+			`{"request":{"generationConfig":{"maxOutputTokens":10,"thinkingConfig":{"thinkingLevel":"medium","includeThoughts":true}}}}`,
+			`{"request":{"generationConfig":{"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":4000}}}}`},
+		{"other level is kept", "catalog-test-gemini-3.8-flash-medium",
+			`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}}`,
+			`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"},"maxOutputTokens":65536}}}`},
+		{"no thinking amount gets none added", "catalog-test-gemini-3.8-flash-medium",
+			`{"request":{"generationConfig":{}}}`,
+			`{"request":{"generationConfig":{"maxOutputTokens":65536}}}`},
+		{"level models keep their level", "catalog-test-gemini-3.5-flash-lite",
+			`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"lite"}}}}`,
+			`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"lite"},"maxOutputTokens":65535}}}`},
+		{"unknown model drops maxOutputTokens as before", "catalog-test-unknown",
+			`{"request":{"generationConfig":{"maxOutputTokens":10,"thinkingConfig":{"thinkingLevel":"medium"}}}}`,
+			`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium"}}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(applyAntigravityCatalogGenerationConfig([]byte(tc.in), tc.model)); got != tc.want {
+				t.Fatalf("got  %s\nwant %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOrderAntigravityPayloadFollowsDesktopFieldOrder(t *testing.T) {
-	in := []byte(`{"model":"m","request":{"sessionId":"-1","generationConfig":{"b":1,"a":2},"labels":{},"extra":true,"tools":[],"systemInstruction":{},"contents":[]},"enabledCreditTypes":["X"],"requestType":"agent","userAgent":"antigravity","requestId":"r","project":"p"}`)
-	want := `{"project":"p","requestId":"r","request":{"contents":[],"systemInstruction":{},"tools":[],"labels":{},"generationConfig":{"b":1,"a":2},"sessionId":"-1","extra":true},"model":"m","userAgent":"antigravity","requestType":"agent","enabledCreditTypes":["X"]}`
+	in := []byte(`{"model":"m","request":{"sessionId":"-1","generationConfig":{"b":1,"thinkingConfig":{"thinkingBudget":4000,"includeThoughts":true},"maxOutputTokens":65536},"labels":{},"extra":true,"tools":[],"systemInstruction":{},"contents":[]},"enabledCreditTypes":["X"],"requestType":"agent","userAgent":"antigravity","requestId":"r","project":"p"}`)
+	want := `{"project":"p","requestId":"r","request":{"contents":[],"systemInstruction":{},"tools":[],"labels":{},"generationConfig":{"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":4000},"b":1},"sessionId":"-1","extra":true},"model":"m","userAgent":"antigravity","requestType":"agent","enabledCreditTypes":["X"]}`
 	if got := string(orderAntigravityPayload(in)); got != want {
 		t.Fatalf("orderAntigravityPayload =\n%s\nwant\n%s", got, want)
 	}

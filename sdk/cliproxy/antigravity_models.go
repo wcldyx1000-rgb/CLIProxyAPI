@@ -512,7 +512,7 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	if !ok {
 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
 	}
-	executor.RecordAntigravityModelEnums(parseAntigravityModelEnums(data))
+	executor.RecordAntigravityCatalogModels(parseAntigravityCatalogModels(data))
 	return hints, antigravityProbeStatusSuccess
 }
 
@@ -597,24 +597,34 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs}, true
 }
 
-// parseAntigravityModelEnums maps each catalog model ID to the enum name in its
-// "model" field, which agent requests report as labels.model_enum.
-func parseAntigravityModelEnums(body []byte) map[string]string {
+// parseAntigravityCatalogModels extracts the per-model catalog fields that
+// generate requests copy: the enum name, thinking budget or level, and output
+// limit. thinkingLevel is an enum number in the catalog (1 for
+// gemini-3.5-flash-lite), so only its presence is kept.
+func parseAntigravityCatalogModels(body []byte) map[string]executor.AntigravityCatalogModel {
 	var parsed struct {
 		Models map[string]struct {
-			Model string `json:"model"`
+			Model           string          `json:"model"`
+			ThinkingBudget  *int64          `json:"thinkingBudget"`
+			ThinkingLevel   json.RawMessage `json:"thinkingLevel"`
+			MaxOutputTokens int64           `json:"maxOutputTokens"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil
 	}
-	enums := make(map[string]string, len(parsed.Models))
+	models := make(map[string]executor.AntigravityCatalogModel, len(parsed.Models))
 	for id, details := range parsed.Models {
-		if modelID := normalizeAntigravityFetchedModelID(id); modelID != "" && details.Model != "" {
-			enums[modelID] = details.Model
+		if modelID := normalizeAntigravityFetchedModelID(id); modelID != "" {
+			models[modelID] = executor.AntigravityCatalogModel{
+				Enum:             details.Model,
+				ThinkingBudget:   details.ThinkingBudget,
+				HasThinkingLevel: len(details.ThinkingLevel) > 0 && string(details.ThinkingLevel) != "null",
+				MaxOutputTokens:  details.MaxOutputTokens,
+			}
 		}
 	}
-	return enums
+	return models
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
