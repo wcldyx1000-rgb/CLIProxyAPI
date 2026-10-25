@@ -123,6 +123,29 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 这些请求承载的是客户端自己的功能。本项目照着发，等于凭空制造请求，而且在大凭据池下会成倍增加请求量（参见第 3.3 节 #5494 的教训），所以不跟。
 
+### 2.4 Responses 接口上思考内容被压到最后（体验，2026-10-25）
+
+现象：pi 通过 `/v1/responses` 使用本项目时，思考内容总是和答案同时出现，看起来像“结束时才显示”。
+
+测量：`docs/tools/stream_timing.js` 记录每个流式片段的到达时刻，同一道题分别走三个接口（真实上游）：
+
+| 接口 | Claude Sonnet 4.6 的思考 | Gemini 3.8 Flash 的思考 |
+| --- | --- | --- |
+| `/v1/chat/completions` | 约 1 到 6 秒之间陆续到达 | 2 段摘要，第一段比正文早 1.5 到 2 秒 |
+| `/v1/responses`（修复前） | 39 到 48 片在同一毫秒到达，紧接着就是正文（3/3 次） | 2 段摘要与正文在同一毫秒到达（3/3 次） |
+| `/v1/responses`（修复后） | 约 1.3 到 5.1 秒之间陆续到达 | 摘要先于正文到达 |
+
+原因分两层：
+
+1. **上游**：Gemini 只在思考快结束时给出思考摘要，前几秒没有任何思考内容。chat 接口不缓冲（同一路径上 Claude 的思考是陆续到达的），在 chat 上看到的 Gemini 时序也是这样，所以这一层来自上游，本项目改不了。
+2. **本项目**：`internal/translator/gemini/openai/responses/gemini_openai-responses_response.go` 在拿到思考签名之前，把思考片段都存在 `ReasoningPendingDeltas` 里，签名一到才打开 reasoning 项并一次性发出。Claude 的签名在整段思考结束时才给，Gemini 的签名跟着正文来，所以思考全部被压到正文开始的那一刻。这段逻辑来自上游 #4525，目的是让 reasoning 项在 `output_item.added` 和 `output_item.done` 里带同一个签名。
+
+修复（`354c6571`）：思考文字一到就打开 reasoning 项。签名晚到时，`output_item.added` 里的 `encrypted_content` 为空，签名放在 `output_item.done` 里。这样做依据的是两个客户端的源码：pi（`pi-ai` 的 `openai-responses-shared.js`）和 OpenAI 官方 SDK 的流式累加器，都用 done 事件里的完整项保存 reasoning 项，不用 added 里的。三个原本要求“added 与 done 签名一致”的测试改为新的约定：思考片段在第一个数据块里就发出；签名晚到时 added 为空；done 带正确的签名，项 ID 前后不变。
+
+验证：用 `docs/tools/replay_check.js` 做两轮对话，把第一轮 done 事件里的输出项（含 reasoning 项和工具调用）原样带进第二轮。Gemini 和 Claude 都返回 200，答案正确，说明签名回放没有受影响。
+
+还没有验证的：除 pi 和 OpenAI SDK 以外，其他 Responses 客户端是否从 added 事件读取签名。如果某个客户端这样做，签名晚到时它拿到的是空值。
+
 ## 3. 尚未完成的部分
 
 **结论先行：连接层和生成请求的外层已对齐，有实测依据，修复后的格式也经过真实服务验证。但仍有下表中的差异或未验证项，不能说本项目与官方客户端完全一致。**
@@ -247,6 +270,7 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
   2. `node docs/tools/fake_upstream.js 18090 up.log <模式> <输出目录>/ids.json`：模式为 `403`、`500`、`503`、`429rate`、`429quota`、`eof`。
   3. 用生成的配置启动本项目（不要设置 `HTTPS_PROXY`），向 8319 端口发一个请求，再看 `up.log` 里生成请求的次数和间隔。
   4. Windows 上 `node` 可能经 Volta 启动器包了一层，结束进程时要按命令行找到真正的 `node` 进程，否则端口会被残留进程占住，后面的结果全部作废。
+- 流式思考时序（第 2.4 节）：`CPA_KEY=<本项目的 API 密钥> node docs/tools/stream_timing.js 8317 responses gemini-3.8-flash high`，接口可换成 `chat` 或 `messages`；推理回放用 `node docs/tools/replay_check.js 8317 <模型>`。两者都会向真实上游发请求。
 - 请求外层对比（第 2.3 节）：
   1. 生成有效期 2 天的临时根证书和服务器证书（扩展配置见 `docs/tools/shape_leaf.ext`）：
      ```bash
@@ -264,4 +288,4 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 ## 5. 范围说明
 
-本文只比较网络层行为。账号风险、服务条款与合规性不在本文的验证范围内，不能由这些对比结果推出。
+本文比较网络层行为、请求外层格式和流式输出的时序。账号风险、服务条款与合规性不在本文的验证范围内，不能由这些对比结果推出。
