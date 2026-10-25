@@ -35,7 +35,9 @@ http.createServer((req, res) => {
     log({ generate, ...shapeRequest(req, Buffer.concat(chunks)) });
     if (path.endsWith(':fetchAvailableModels')) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ models: Object.fromEntries(ids.map((id, i) => [id, { model: `MODEL_PLACEHOLDER_M${i}` }])) }));
+      // CATALOG 指向一份真实的模型目录时原样返回，否则按 ID 清单编造只含枚举名的目录
+      res.end(process.env.CATALOG ? fs.readFileSync(process.env.CATALOG)
+        : JSON.stringify({ models: Object.fromEntries(ids.map((id, i) => [id, { model: `MODEL_PLACEHOLDER_M${i}` }])) }));
       return;
     }
     if (!generate) {

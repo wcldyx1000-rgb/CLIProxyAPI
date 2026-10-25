@@ -3,7 +3,9 @@
 // 用法: node shape_proxy.js <日志> <证书.pem> <私钥.pem> [状态码，默认 503]
 //   状态码为 200 时，生成请求得到一条本地编造的成功回复（固定文本 "ok"），可以继续下一轮对话；
 //   其他状态码时生成请求一律返回该错误，用来观察客户端的重试。
-//   环境变量 DEFAULT_MODEL 设置编造的模型目录里的默认模型（桌面端会优先沿用上次选过的模型）。
+//   环境变量：DEFAULT_MODEL 设置编造目录里的默认模型（桌面端会优先沿用上次选过的模型）；
+//   CATALOG 指向一份真实的 fetchAvailableModels 响应，代替编造的目录；
+//   FAKE_TOOL 指向一个文件，新一轮对话先回复一次读取该文件的 view_file 工具调用。
 const net = require('net');
 const tls = require('tls');
 const http = require('http');
@@ -36,6 +38,31 @@ const STUBS = {
   recordCodeAssistMetrics: {},
   recordClientEvent: {},
 };
+// CATALOG 指向一份真实的 fetchAvailableModels 响应时，用它代替编造的模型目录，
+// 让桌面端按真实的模型参数填写生成请求。
+if (process.env.CATALOG) STUBS.fetchAvailableModels = JSON.parse(fs.readFileSync(process.env.CATALOG, 'utf8'));
+
+// FAKE_TOOL 指向一个文件时，对用户的新一轮消息回复一次只读的工具调用（桌面端 2.26.0 的
+// view_file，参数指向该文件），收到工具结果后回复 "ok"，用来抓取工具调用轮次的请求。
+function fakeToolCall(rawBody) {
+  let request;
+  try { request = JSON.parse(rawBody.toString('utf8')).request; } catch (e) { return null; }
+  const contents = (request && request.contents) || [];
+  const last = contents[contents.length - 1];
+  if (!last || last.role !== 'user' || (last.parts || []).some((p) => p.functionResponse)) return null;
+  const decls = (request.tools || []).flatMap((t) => t.functionDeclarations || []);
+  const tool = decls.find((d) => d.name === 'view_file');
+  if (!tool) { log({ event: 'fake-tool', error: 'no view_file tool', tools: decls.map((d) => d.name) }); return null; }
+  const args = {};
+  for (const [name, schema] of Object.entries((tool.parameters && tool.parameters.properties) || {})) {
+    if (/dir|path/i.test(name)) args[name] = process.env.FAKE_TOOL;
+    else if (/^toolAction$/.test(name)) args[name] = 'List directory';
+    else if (/^toolSummary$/.test(name)) args[name] = 'capture test';
+    else if ((schema.type || '').toUpperCase() === 'STRING' && ((tool.parameters.required || []).includes(name))) args[name] = 'x';
+  }
+  log({ event: 'fake-tool', tool: tool.name, argNames: Object.keys(args) });
+  return { functionCall: { name: tool.name, args } };
+}
 const t0 = Date.now();
 let seq = 0;
 const log = (o) => fs.appendFileSync(logPath, JSON.stringify({ t: Date.now() - t0, wall: new Date().toISOString(), ...o }) + '\n');
@@ -45,12 +72,19 @@ const inner = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (d) => chunks.push(d));
   req.on('end', () => {
-    log({ conn: req.socket.connId, host: req.socket.servername, ...shapeRequest(req, Buffer.concat(chunks)) });
+    // 生成请求额外记录 contents 的角色与部件类型序列（不含内容），用来核对 step 和 labels 的计数规则
+    let roles;
+    try {
+      const c = JSON.parse(Buffer.concat(chunks).toString('utf8')).request.contents;
+      roles = c.map((x) => `${x.role}:${(x.parts || []).map((p) => Object.keys(p).filter((k) => k !== 'thoughtSignature').join('+')).join(',')}`);
+    } catch (e) { /* 不是生成请求 */ }
+    log({ conn: req.socket.connId, host: req.socket.servername, ...(roles ? { roles } : {}), ...shapeRequest(req, Buffer.concat(chunks)) });
     // 启动阶段的查询接口返回本地编造的最小响应，让桌面端走到对话请求；对话请求一律返回错误。
     const path = req.url.split('?')[0];
     if (STATUS === 200 && /generateContent$/i.test(path)) {
-      // 本地编造的一条成功回复（固定文本），让桌面端能进入下一轮对话
-      const chunk = { response: { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      // 本地编造的一条成功回复（固定文本或一次工具调用），让桌面端能进入下一轮对话
+      const toolPart = process.env.FAKE_TOOL && /"requestType":"agent"/.test(Buffer.concat(chunks).toString('utf8')) ? fakeToolCall(Buffer.concat(chunks)) : null;
+      const chunk = { response: { candidates: [{ content: { role: 'model', parts: [toolPart || { text: 'ok' }] }, finishReason: 'STOP' }],
         usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 1, totalTokenCount: 11 }, modelVersion: 'local-capture' }, traceId: 'local' };
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(`data: ${JSON.stringify(chunk)}\r\n\r\n`);

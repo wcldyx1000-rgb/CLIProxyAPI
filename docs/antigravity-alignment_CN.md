@@ -91,29 +91,39 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 | `requestId` | `agent/<cascade_id>/<毫秒时间戳>/<trajectory_id>/<step>` | `agent-<uuid>` | 与客户端格式相同 | 已修复（`step` 的取法见下） |
 | `request` 内字段顺序 | `contents`、`systemInstruction`、`tools`、`labels`、`generationConfig`、`sessionId` | 没有 `labels`，其余顺序取决于下游请求 | 与客户端相同 | 已修复（`toolConfig` 的位置没有观测到，暂放在 `tools` 之后） |
 | `request.labels` | 见下文，键按名称排序 | 没有 | 与客户端相同 | 已修复（部分取值是推断，见下） |
-| `generationConfig` | 抓取中为 `maxOutputTokens` 加 `thinkingConfig{includeThoughts, thinkingBudget}` | Gemini 模型不发 `maxOutputTokens`；`thinkingConfig` 用 `thinkingLevel` | 未改 | 待验证：客户端按服务端模型目录填这两项，抓取时目录是编造的，结果不代表真实情况 |
-| Claude 模型的 `toolConfig` | 抓取中没有 | 设 `functionCallingConfig.mode=VALIDATED` | 未改 | 待验证（原因同上） |
+| Gemini 的 `generationConfig`（真实目录） | `{"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}`，两个数值都取自目录里该模型的条目 | 不发 `maxOutputTokens`；3.8 系列发 `thinkingLevel` | 发目录里的 `maxOutputTokens`；思考档位与模型后缀一致时换成目录预算（medium → 4000），字段顺序同客户端 | 已修复（规则见下） |
+| Claude 的 `generationConfig`（真实目录） | `maxOutputTokens` 64000、`thinkingBudget` 1024，都取自目录 | 按下游请求的 `max_tokens` 和推理强度 | 未改 | 有差异：下游明确要求的输出上限和思考量应当尊重 |
+| Claude 的 `toolConfig`（真实目录） | 不带 | 强制设 `functionCallingConfig.mode=VALIDATED`，连下游的 `tool_choice: none` 也会被覆盖 | 保留下游给的设置；没有时不带 | 已修复 |
+| 工具结果（`functionResponse`）的角色 | Gemini 模型时为 `model`，Claude 模型时为 `user` | 按下游格式转换，一般为 `user` | 未改 | 有差异：改角色可能影响上游对工具结果的理解，没有把握前不动 |
 | 工具参数的 `type` 写法 | 大写，如 `OBJECT`、`STRING` | 原样转发下游的小写写法 | 未改 | 有差异：取值来自下游的工具定义，属于内容层 |
 
 关于 `User-Agent`：本项目固定报 `os_type=darwin; arch=arm64`，即模拟 mac 版客户端，这是原有的选择，本次不变。为确认 mac 版也用同一个 `cl`，下载了官方 2.26.0 darwin-arm 安装包（SHA-512 与更新清单一致），其中的 `language_server` 和 `webm_encoder` 都含 `1005016104`。后备版本同时改为 2.26.0。
 
-**`requestId` 与 `labels` 的规律**（3 轮对话、每轮无工具调用时实测）：
+**`requestId` 与 `labels` 的规律**（纯对话 3 轮，以及 3 轮“每轮一次 `view_file` 工具调用”的对话实测）：
 
-- `step` 等于 `request.contents` 的条数（第 1、2、3 轮分别为 1、3、5）；`labels.last_step_index` 等于 `step − 1`。
+- `step` 等于 `request.contents` 的条数，工具调用后的续写请求也一样（1、3、5、7、9、11）；`labels.last_step_index` 等于 `step − 1`。
 - `cascade_id`、`trajectory_id` 是两个不同的随机 UUID（版本 4），同一对话内不变；`root_cascade_id` 等于 `cascade_id`。
-- `labels.request_id` 为 `<trajectory_id>-<轮次>`，轮次从 0 开始。
-- 从第二轮起多一个 `last_execution_id`（UUID），与其他 ID 看不出关系。
-- `model_enum` 为模型目录里该模型的 `model` 字段（如 `MODEL_PLACEHOLDER_M20`）。
+- `labels.request_id` 为 `<trajectory_id>-<n>`，`n` 是请求里**模型已经产出的次数**（模型回复和工具调用都算，工具结果不算），每发一次生成请求加 1：0、1、2、3、4、5。纯对话时它恰好等于轮次，所以最初误以为是轮次。
+- 用户第二次发言起出现 `last_execution_id`（UUID），之后的工具结果续写请求里也有；第一轮的工具结果续写请求里没有。它和其他 ID 看不出关系。
+- `model_enum` 为模型目录里该模型的 `model` 字段（真实目录里 `gemini-3.8-flash-high` 是 `MODEL_PLACEHOLDER_M318`）。
 - `used_claude`、`used_claude_conservative`、`used_non_gemini_model`：Gemini 模型三个都是 `"false"`，Claude 模型三个都是 `"true"`。
 
-本项目的做法（`internal/runtime/executor/antigravity_request_envelope.go`）：本项目没有客户端的会话状态，所以 `cascade_id`、`trajectory_id`、`last_execution_id` 由 `project` 和 `sessionId` 经 SHA-256 推导，并按版本 4 UUID 的格式输出，同一对话的多轮和重试保持不变，不需要保存状态。下面几点是推断，没有实测依据：
+本项目的做法（`internal/runtime/executor/antigravity_request_envelope.go`）：本项目没有客户端的会话状态，所以 `cascade_id`、`trajectory_id`、`last_execution_id` 由 `project` 和 `sessionId` 经 SHA-256 推导，并按版本 4 UUID 的格式输出，同一对话的多轮和重试保持不变，不需要保存状态。计数时把只含 `functionResponse` 的消息当作工具结果，不论角色是 `model` 还是 `user`。下面几点是推断，没有实测依据：
 
-- 有工具调用的轮次，`step` 仍取 `contents` 的条数；只由 `functionResponse` 组成的用户消息不算新的一轮。
 - 其他模型（既非 Gemini 也非 Claude）的 `used_non_gemini_model` 取 `"true"`、两个 `used_claude*` 取 `"false"`。
 - 模型目录尚未报告 `model_enum` 时省略这个键。
 - 本项目的 `sessionId` 在下游没有提供时由第一条用户消息的哈希生成，所以两段开头相同的对话会得到相同的 ID；客户端每段对话都是新的随机 ID。
 
 **真实服务端验证**：用修复后的构建另起一个实例，向真实服务各发一条请求：Gemini 多轮对话（带系统提示）返回 200，3.96 秒；Claude 带工具调用返回 200，2.28 秒，正确产生工具调用。
+
+**用真实模型目录重抓（第二次抓取）**：第一次抓取时模型目录是编造的，`generationConfig` 和 Claude 的 `toolConfig` 只能标为待验证。第二次先用本项目自己的目录探测客户端（`NewAntigravityCatalogHTTPClient`，无 ALPN，与平时探测相同）拉取一份真实的 `fetchAvailableModels` 响应，再由不转发代理把它交给桌面端（`shape_proxy.js` 的 `CATALOG` 变量）。目录里 3.8 各档位都只有 `thinkingBudget`（low 1000、medium 4000、high -1），没有 `thinkingLevel`；只有 `gemini-3.5-flash-lite` 用 level。桌面端界面里 3.8 只提供 High 档（来自目录的 `agentModelSorts`），所以它的对话请求只会用 `gemini-3.8-flash-high`。另外，每段对话开头的 checkpoint 请求用 `gemini-3.5-flash-lite`，配 `thinkingLevel: "LOW"`。
+
+本项目按目录填写 Gemini 的 `generationConfig` 时遵守两条限制：
+
+- 只有思考档位与模型后缀一致时才换成目录预算（例如 `effort=medium` 选中 `gemini-3.8-flash-medium`，`medium` 换成 4000），两者表示的是同一个档位；其他档位原样保留。
+- 请求里没有任何思考量时不补预算。走到这一步时，客户端明确关闭思考的请求（思考配置已被删除）和什么都没给的请求看起来一样，补上预算会把关掉的思考重新打开。
+
+目录要等本项目的模型探测完成后才有；在那之前的请求按原来的方式发送，不会出错。第二次抓取后的真实服务端验证：`gemini-3.8-flash` 的 low、medium、high、none 四档都返回 200；Gemini 和 Claude 的两轮工具调用回放都返回 200，Claude 不再强制 `VALIDATED` 后照常产生工具调用。
 
 **客户端的其他请求**（本项目都没有，未改）：
 
@@ -146,19 +156,26 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 还没有验证的：除 pi 和 OpenAI SDK 以外，其他 Responses 客户端是否从 added 事件读取签名。如果某个客户端这样做，签名晚到时它拿到的是空值。
 
+### 2.5 思考内容的可见性（体验，2026-10-25）
+
+两处让思考内容“明明产生了却看不到”的问题：
+
+1. **`/v1/messages` 上 `gemini-3.8-flash` 不返回思考**（`40780b98`）。Claude 格式的请求开了思考、没有 `thinking.display` 时，发给上游的只有 `thinkingBudget`，没有 `includeThoughts`。实测同样的请求：`gemini-3-flash` 返回思考，`gemini-3.8-flash` 一个思考片段都没有（2/2）。本项目的思考可见性框架在没有 `display` 时刻意不做决定，因为 Anthropic 不同模型的默认值不同；但 Gemini 模型没有这套默认值。修复只针对 Gemini 目标模型：思考开启且没有 `display` 时补上 `includeThoughts: true`。Claude 目标模型不变，明确的 `display` 仍以客户端为准。修复后同一请求返回思考摘要（2/2）。
+2. **客户端不传推理参数时不返回思考**（配置，不在仓库里）。不传 `reasoning_effort` 时请求里没有思考配置，Gemini 3 照样思考（实测用掉 378 个思考 token），但不返回摘要。在本机配置的 `requests.payload.default` 里为 `gemini-*` 加了 `"generationConfig.thinkingConfig.includeThoughts": true`。默认规则只补缺失的字段，而明确关闭思考时请求里写的是 `includeThoughts: false`（用假上游确认过），所以不会推翻客户端的选择，也不增加思考量。线上实测不传参数的 chat 请求 5 次里 4 次返回了思考，没返回的那次本项目确实发了 `includeThoughts: true`，是上游没给摘要。
+
 ## 3. 尚未完成的部分
 
-**结论先行：连接层和生成请求的外层已对齐，有实测依据，修复后的格式也经过真实服务验证。但仍有下表中的差异或未验证项，不能说本项目与官方客户端完全一致。**
+**结论先行：连接层、生成请求的外层和 Gemini 的生成参数已对齐，有实测依据，修复后的格式也经过真实服务验证。但仍有下表中的差异或未验证项，不能说本项目与官方客户端完全一致。**
 
 按对“像不像官方客户端”的影响排序：
 
 | 优先级 | 项目 | 目前状况 | 怎么完成 |
 | --- | --- | --- | --- |
-| 1 | `generationConfig`（`maxOutputTokens`、思考参数）和 Claude 的 `toolConfig` | 客户端按服务端模型目录填写，抓取时目录是编造的（第 2.3 节） | 本项目自己会拉取真实模型目录，把它交给不转发代理当作响应，再抓一次 |
-| 2 | 有工具调用时的 `step` 和 `labels` | 只测了无工具调用的轮次，工具调用轮次的取法是推断 | 让不转发代理编造一个带 `functionCall` 的回复，再抓一次 |
+| 1 | 工具结果（`functionResponse`）的角色 | 桌面端对 Gemini 模型写 `model`，本项目按下游格式写 `user`（第 2.3 节） | 先在测试实例上验证改成 `model` 后上游对工具结果的理解不变，再决定 |
+| 2 | Claude 的输出上限和思考预算 | 桌面端用目录值（64000、1024），本项目按下游请求 | 属于下游意图，暂不改 |
 | 3 | 客户端对 503 在同一凭据上退避重试，本项目单凭据时不重试 | 已实测客户端的节奏（第 3.4 节） | 是否要跟需要权衡，暂不改 |
-| 4 | `aicode.googleapis.com` | 本次抓取期间没有出现对它的请求，用途未知 | 待观察 |
-| 5 | `credits_query` 对应的客户端调用 | 本次抓取中客户端调用的是 `retrieveUserQuotaSummary`，与本项目的积分查询是否对应还没有比较 | 对比两边的请求体 |
+| 4 | `aicode.googleapis.com` | 两次解密抓取期间都没有出现对它的请求，用途未知 | 待观察 |
+| 5 | `credits_query` 对应的客户端调用 | 抓取中客户端调用的是 `retrieveUserQuotaSummary`，与本项目的积分查询是否对应还没有比较 | 对比两边的请求体 |
 | 6 | 耗时对比 | 只有 `agy` 与本项目的数据（第 3.1 节）。两边请求体本来就不同，耗时主要由模型思考决定，对判断对齐程度帮助有限 | 暂不做 |
 | 7 | 模型请求实际使用的传输参数 | 静态分析没有找到调用方（第 3.2 节） | 暂不做 |
 
@@ -262,14 +279,16 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 ## 4. 复现与回归
 
-- 单元测试：`go test ./internal/runtime/executor/ ./sdk/cliproxy/ ./internal/misc/`，其中 `TestNewAntigravityCatalogHTTPClientOmitsALPN` 保证非生成请求不发 ALPN，`antigravity_request_envelope_test.go` 固定第 2.3 节的请求外层，`antigravity_version_wait_test.go` 覆盖启动时的版本等待。
+- 单元测试：`go test ./internal/runtime/executor/ ./sdk/cliproxy/ ./internal/misc/`，其中 `TestNewAntigravityCatalogHTTPClientOmitsALPN` 保证非生成请求不发 ALPN，`antigravity_request_envelope_test.go` 固定第 2.3 节的请求外层，`antigravity_version_wait_test.go` 覆盖启动时的版本等待。在 Windows 上跑全量测试时，`internal/store` 有 3 个测试失败（git 凭据存储的损坏恢复：删除仍被打开的 packfile 在 Windows 上照样可读，且 Windows 的“找不到文件”报错没有被判定为仓库损坏）。它们在本轮改动之前就失败，与 Antigravity 无关；要修就得放宽凭据仓库的损坏判定，判错的代价比测试失败大，所以没有改。
 - 抓取回归：每次改动 Antigravity 的网络层后，重新跑第 1.1 节的抓取，确认 `daily-cloudcode-pa.googleapis.com` 的所有连接都是 `NO-ALPN-EXTENSION`。
 - 连接时间线（第 3.3 节）：`node docs/tools/timing_proxy.js timeline.log` 启动代理（端口 18081），被测程序带 `HTTPS_PROXY=http://127.0.0.1:18081` 运行，结束后用 `node docs/tools/timeline_summary.js timeline.log` 汇总。
 - 重试实测（第 3.4 节），不访问真实服务：
   1. `node docs/tools/make_fake.js <一份真实凭据> <配置文件> <输出目录> 18090 8319 [凭据份数]`：生成指向本地假上游的假凭据和测试配置。只从真实凭据里复制模型 ID 列表，不复制令牌。
   2. `node docs/tools/fake_upstream.js 18090 up.log <模式> <输出目录>/ids.json`：模式为 `403`、`500`、`503`、`429rate`、`429quota`、`eof`。
   3. 用生成的配置启动本项目（不要设置 `HTTPS_PROXY`），向 8319 端口发一个请求，再看 `up.log` 里生成请求的次数和间隔。
-  4. Windows 上 `node` 可能经 Volta 启动器包了一层，结束进程时要按命令行找到真正的 `node` 进程，否则端口会被残留进程占住，后面的结果全部作废。
+  4. Windows 上 `node` 可能经 Volta 启动器包了一层，结束进程时要按命令行找到真正的 `node` 进程，否则端口会被残留进程占住，后面的结果全部作废。被测的本项目进程同样可能残留：发请求前先确认测试端口上监听的正是本次启动的进程（`Get-NetTCPConnection -State Listen -LocalPort 8319`）。本次就有一组结果来自残留的旧构建，发现后已重测。
+  5. 本项目的模型探测要先等首次版本拉取（最多 10 秒），依赖模型目录的结果（`model_enum`、按目录填写的 `generationConfig`）需要启动后等二三十秒再发请求。
+  6. 在 Git Bash 里调用 PowerShell 脚本时，以 `/` 开头的参数（如 `/v1/messages`）会被自动改写成 Windows 路径，要加 `MSYS_NO_PATHCONV=1`。
 - 流式思考时序（第 2.4 节）：`CPA_KEY=<本项目的 API 密钥> node docs/tools/stream_timing.js 8317 responses gemini-3.8-flash high`，接口可换成 `chat` 或 `messages`；推理回放用 `node docs/tools/replay_check.js 8317 <模型>`。两者都会向真实上游发请求。
 - 请求外层对比（第 2.3 节）：
   1. 生成有效期 2 天的临时根证书和服务器证书（扩展配置见 `docs/tools/shape_leaf.ext`）：
@@ -280,7 +299,7 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
      openssl x509 -in ca.pem -outform der -out ca.cer
      ```
   2. 由本人把根证书加入当前用户的信任列表：`certutil -user -addstore Root ca.cer`（Windows 会弹出确认框）。这一步削弱本机的 TLS 校验，测完必须删除。
-  3. `node docs/tools/shape_proxy.js client.log leaf.pem leaf.key 503`（或 `200`），监听 127.0.0.1:18082。
+  3. `node docs/tools/shape_proxy.js client.log leaf.pem leaf.key 503`（或 `200`），监听 127.0.0.1:18082。要用真实模型目录时设 `CATALOG=<目录响应文件>`，要抓工具调用轮次时设 `FAKE_TOOL=<一个可读的文件>`（详见脚本开头的说明）。真实目录用本项目的 `NewAntigravityCatalogHTTPClient` 拉取，不要用 `cmd/fetch_antigravity_models`：后者用的是 Go 默认客户端，会宣告 `h2`（见第 2.1 节）。
   4. 带 `HTTPS_PROXY=http://127.0.0.1:18082`、`NO_PROXY=127.0.0.1,localhost` 和 `--remote-debugging-port=9333 --remote-allow-origins=*` 启动桌面端；`node docs/tools/send.js "<消息>" new` 在后台发消息，`node docs/tools/click_text.js "<文字>"...` 点击界面（例如切换模型）。
   5. 汇总：`node docs/tools/print_shapes.js client.log`（全部请求）、`node docs/tools/gen_summary.js client.log`（生成请求的关键字段）、`node docs/tools/retry_gaps.js client.log`（重试间隔）。本项目一侧用上面的假上游，日志格式相同。
   6. 收尾：`certutil -user -delstore Root <根证书 SHA-1 指纹>`，删除 `ca.key`、`leaf.key`，再用 `certutil -user -store Root <指纹>` 确认已找不到。
