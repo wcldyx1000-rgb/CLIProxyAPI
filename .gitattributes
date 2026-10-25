@@ -1,0 +1,4 @@
+# Test fixtures are compared byte for byte (golden files, raw JSON passthrough).
+# Check them out exactly as committed so a Windows checkout with core.autocrlf
+# does not turn LF into CRLF and fail tests that pass on Linux.
+**/testdata/** -text
