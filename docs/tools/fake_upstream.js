@@ -32,7 +32,13 @@ http.createServer((req, res) => {
     const path = req.url.split('?')[0];
     const generate = /:(stream)?[gG]enerateContent$/.test(path);
     // 记录请求形状（规则见 req_shape.js），与桌面端解密代理的记录方式相同，便于逐字段对比
-    log({ generate, ...shapeRequest(req, Buffer.concat(chunks)) });
+    // 生成请求额外记录 contents 的角色与部件类型序列（不含内容）
+    let roles;
+    try {
+      roles = JSON.parse(Buffer.concat(chunks).toString('utf8')).request.contents
+        .map((x) => `${x.role}:${(x.parts || []).map((p) => Object.keys(p).filter((k) => k !== 'thoughtSignature').join('+')).join(',')}`);
+    } catch (e) { /* 不是生成请求 */ }
+    log({ generate, ...(roles ? { roles } : {}), ...shapeRequest(req, Buffer.concat(chunks)) });
     if (path.endsWith(':fetchAvailableModels')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       // CATALOG 指向一份真实的模型目录时原样返回，否则按 ID 清单编造只含枚举名的目录

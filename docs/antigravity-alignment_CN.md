@@ -94,7 +94,7 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 | Gemini 的 `generationConfig`（真实目录） | `{"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}`，两个数值都取自目录里该模型的条目 | 不发 `maxOutputTokens`；3.8 系列发 `thinkingLevel` | 发目录里的 `maxOutputTokens`；思考档位与模型后缀一致时换成目录预算（medium → 4000），字段顺序同客户端 | 已修复（规则见下） |
 | Claude 的 `generationConfig`（真实目录） | `maxOutputTokens` 64000、`thinkingBudget` 1024，都取自目录 | 按下游请求的 `max_tokens` 和推理强度 | 未改 | 有差异：下游明确要求的输出上限和思考量应当尊重 |
 | Claude 的 `toolConfig`（真实目录） | 不带 | 强制设 `functionCallingConfig.mode=VALIDATED`，连下游的 `tool_choice: none` 也会被覆盖 | 保留下游给的设置；没有时不带 | 已修复 |
-| 工具结果（`functionResponse`）的角色 | Gemini 模型时为 `model`，Claude 模型时为 `user` | 按下游格式转换，一般为 `user` | 未改 | 有差异：改角色可能影响上游对工具结果的理解，没有把握前不动 |
+| 工具结果（`functionResponse`）的角色 | Gemini 模型时为 `model`，Claude 模型时为 `user` | 相同：chat、responses、messages 三个接口实测都是 Gemini 为 `model`、Claude 为 `user`（由 `normalizeAntigravityGeminiFunctionResponseRoles` 处理） | 无需修改 | 已验证（此前误记为有差异，见下） |
 | 工具参数的 `type` 写法 | 大写，如 `OBJECT`、`STRING` | 原样转发下游的小写写法 | 未改 | 有差异：取值来自下游的工具定义，属于内容层 |
 
 关于 `User-Agent`：本项目固定报 `os_type=darwin; arch=arm64`，即模拟 mac 版客户端，这是原有的选择，本次不变。为确认 mac 版也用同一个 `cl`，下载了官方 2.26.0 darwin-arm 安装包（SHA-512 与更新清单一致），其中的 `language_server` 和 `webm_encoder` 都含 `1005016104`。后备版本同时改为 2.26.0。
@@ -124,6 +124,8 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 - 请求里没有任何思考量时不补预算。走到这一步时，客户端明确关闭思考的请求（思考配置已被删除）和什么都没给的请求看起来一样，补上预算会把关掉的思考重新打开。
 
 目录要等本项目的模型探测完成后才有；在那之前的请求按原来的方式发送，不会出错。第二次抓取后的真实服务端验证：`gemini-3.8-flash` 的 low、medium、high、none 四档都返回 200；Gemini 和 Claude 的两轮工具调用回放都返回 200，Claude 不再强制 `VALIDATED` 后照常产生工具调用。
+
+**更正：工具结果的角色。** 第二次抓取后，本文一度把“工具结果的角色”记为有差异，写的是本项目“按下游格式转换，一般为 `user`”。这是根据下游请求的原始格式推测的，没有实测本项目实际发出的内容。准备做对比测试时，先用假上游记录了本项目的实际请求：chat、responses、messages 三个接口都是 Gemini 模型为 `model`、Claude 模型为 `user`，与桌面端完全相同。原因是执行器里早就有 `normalizeAntigravityGeminiFunctionResponseRoles`，会把 Gemini 请求里的工具结果改成 `model`。因此这一项改为已验证，没有改代码，也没有为此发真实请求。教训：本项目一侧的结论同样要看实际发出的请求，不能看转换前的格式。
 
 **客户端的其他请求**（本项目都没有，未改）：
 
@@ -171,13 +173,12 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 | 优先级 | 项目 | 目前状况 | 怎么完成 |
 | --- | --- | --- | --- |
-| 1 | 工具结果（`functionResponse`）的角色 | 桌面端对 Gemini 模型写 `model`，本项目按下游格式写 `user`（第 2.3 节） | 先在测试实例上验证改成 `model` 后上游对工具结果的理解不变，再决定 |
-| 2 | Claude 的输出上限和思考预算 | 桌面端用目录值（64000、1024），本项目按下游请求 | 属于下游意图，暂不改 |
-| 3 | 客户端对 503 在同一凭据上退避重试，本项目单凭据时不重试 | 已实测客户端的节奏（第 3.4 节） | 是否要跟需要权衡，暂不改 |
-| 4 | `aicode.googleapis.com` | 两次解密抓取期间都没有出现对它的请求，用途未知 | 待观察 |
-| 5 | `credits_query` 对应的客户端调用 | 抓取中客户端调用的是 `retrieveUserQuotaSummary`，与本项目的积分查询是否对应还没有比较 | 对比两边的请求体 |
-| 6 | 耗时对比 | 只有 `agy` 与本项目的数据（第 3.1 节）。两边请求体本来就不同，耗时主要由模型思考决定，对判断对齐程度帮助有限 | 暂不做 |
-| 7 | 模型请求实际使用的传输参数 | 静态分析没有找到调用方（第 3.2 节） | 暂不做 |
+| 1 | Claude 的输出上限和思考预算 | 桌面端用目录值（64000、1024），本项目按下游请求 | 属于下游意图，暂不改 |
+| 2 | 客户端对 503 在同一凭据上退避重试，本项目单凭据时不重试 | 已实测客户端的节奏（第 3.4 节） | 是否要跟需要权衡，暂不改 |
+| 3 | `aicode.googleapis.com` | 两次解密抓取期间都没有出现对它的请求，用途未知 | 待观察 |
+| 4 | `credits_query` 对应的客户端调用 | 抓取中客户端调用的是 `retrieveUserQuotaSummary`，与本项目的积分查询是否对应还没有比较 | 对比两边的请求体 |
+| 5 | 耗时对比 | 只有 `agy` 与本项目的数据（第 3.1 节）。两边请求体本来就不同，耗时主要由模型思考决定，对判断对齐程度帮助有限 | 暂不做 |
+| 6 | 模型请求实际使用的传输参数 | 静态分析没有找到调用方（第 3.2 节） | 暂不做 |
 
 已完成、有实测依据的项目见第 2 节。
 

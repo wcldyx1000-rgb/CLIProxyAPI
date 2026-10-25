@@ -81,8 +81,8 @@ func TestAntigravityAgentEnvelopeClaudeLabelsAndToolResults(t *testing.T) {
 }
 
 // The sequence below is the desktop client's captured conversation: two user
-// turns, each answered by one view_file call and a text reply. The client sends
-// tool results with role "model"; Gemini-style requests use role "user".
+// turns, each answered by one view_file call and a text reply. Tool results
+// carry role "model" for Gemini models and "user" for Claude models.
 func TestAntigravityAgentEnvelopeToolTurnsMatchDesktopCounts(t *testing.T) {
 	const (
 		user     = `{"role":"user","parts":[{"text":"q"}]}`

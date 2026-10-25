@@ -131,8 +131,9 @@ func antigravityDerivedUUID(parts ...string) string {
 }
 
 // antigravityCountContents counts contents with the given role, skipping tool
-// results: a content made only of functionResponse parts. The desktop client
-// sends tool results with role "model", Gemini-style requests with role "user";
+// results: a content made only of functionResponse parts. Tool results carry
+// role "model" for Gemini models and "user" for Claude models, in the desktop
+// client and in this service alike (normalizeAntigravityGeminiFunctionResponseRoles);
 // neither is a user turn or a model output.
 func antigravityCountContents(contents gjson.Result, role string) int {
 	count := 0
