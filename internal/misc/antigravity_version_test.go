@@ -70,6 +70,7 @@ func TestAntigravityUserAgentUsesHubFamily(t *testing.T) {
 		{"2.23.0", "antigravity/hub/2.23.0 (aidev_client; os_type=darwin; arch=arm64; cl=998057262)"},
 		{"2.24.0", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)"},
 		{"2.25.0", "antigravity/hub/2.25.0 (aidev_client; os_type=darwin; arch=arm64)"},
+		{"2.26.0", "antigravity/hub/2.26.0 (aidev_client; os_type=darwin; arch=arm64; cl=1005016104)"},
 	} {
 		t.Run(tc.version, func(t *testing.T) {
 			restore := overrideAntigravityVersionCacheForTest(t, tc.version, time.Now().Add(time.Hour))

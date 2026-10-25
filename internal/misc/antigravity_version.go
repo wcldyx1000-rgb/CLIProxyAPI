@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -20,7 +21,7 @@ const (
 	// manifest has not been fetched yet or cannot be reached. Cloud Code rejects
 	// newer models for clients below 2.23.0, so this floor must stay at or above
 	// that version.
-	antigravityFallbackVersion = "2.24.0"
+	antigravityFallbackVersion = "2.26.0"
 	antigravityHubPlatform     = "os_type=darwin; arch=arm64"
 	antigravityVersionCacheTTL = 6 * time.Hour
 	antigravityFetchTimeout    = 10 * time.Second
@@ -35,10 +36,13 @@ var (
 // Changelists belong to specific Hub releases, not to the latest manifest in
 // general. Update the fallback release and its entry together. The 2.24.0 value
 // was verified in the official darwin-arm archive's webm_encoder build metadata.
+// The 2.26.0 value was seen on the wire from the Windows desktop client and found
+// in the darwin-arm archive's language_server and webm_encoder binaries.
 // Unknown releases keep their online version without claiming another build's CL.
 var antigravityHubChangelists = map[string]string{
 	"2.23.0": "998057262",
 	"2.24.0": "1000335682",
+	"2.26.0": "1005016104",
 }
 
 type antigravityHubUpdaterManifest struct {
@@ -50,14 +54,41 @@ var (
 	antigravityVersionMu     sync.RWMutex
 	antigravityVersionExpiry time.Time
 	antigravityUpdaterOnce   sync.Once
+
+	// antigravityFirstRefreshDone is closed after the updater's first refresh
+	// attempt, whether it succeeded or not.
+	antigravityFirstRefreshDone = make(chan struct{})
+	antigravityUpdaterStarted   atomic.Bool
 )
 
 // StartAntigravityVersionUpdater starts a background goroutine that periodically refreshes the cached antigravity version.
 // This is intentionally decoupled from request execution to avoid blocking executors on version lookups.
 func StartAntigravityVersionUpdater(ctx context.Context) {
 	antigravityUpdaterOnce.Do(func() {
+		antigravityUpdaterStarted.Store(true)
 		go runAntigravityVersionUpdater(ctx)
 	})
+}
+
+// WaitForAntigravityVersion blocks until the updater's first refresh attempt
+// finishes, ctx ends, or maxWait elapses. Background callers that would
+// otherwise send their first request with the fallback version and switch to
+// the fetched one moments later use it so every request reports one version.
+// It returns immediately when the updater was never started.
+func WaitForAntigravityVersion(ctx context.Context, maxWait time.Duration) {
+	if !antigravityUpdaterStarted.Load() || maxWait <= 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	select {
+	case <-antigravityFirstRefreshDone:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func runAntigravityVersionUpdater(ctx context.Context) {
@@ -71,6 +102,7 @@ func runAntigravityVersionUpdater(ctx context.Context) {
 	log.Infof("periodic antigravity version refresh started (interval=%s)", antigravityVersionCacheTTL/2)
 
 	refreshAntigravityVersion(ctx)
+	close(antigravityFirstRefreshDone)
 
 	for {
 		select {
