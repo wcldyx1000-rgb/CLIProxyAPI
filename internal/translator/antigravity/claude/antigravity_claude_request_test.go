@@ -2707,6 +2707,27 @@ func TestConvertClaudeRequestToAntigravity_ThinkingConfig(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_GeminiTargetIncludesThoughtsForActiveThinking(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		thinking string
+		want     string
+	}{
+		{"enabled", `{"type":"enabled","budget_tokens":4096}`, "true"},
+		{"adaptive", `{"type":"adaptive"}`, "true"},
+		{"explicit display is left to the summary framework", `{"type":"enabled","budget_tokens":4096,"display":"omitted"}`, ""},
+		{"disabled", `{"type":"disabled"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := []byte(`{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"hi"}],"thinking":` + tc.thinking + `}`)
+			output, _ := ConvertClaudeRequestToAntigravity("gemini-3.8-flash", input, true)
+			if got := gjson.GetBytes(output, "request.generationConfig.thinkingConfig.includeThoughts").Raw; got != tc.want {
+				t.Fatalf("includeThoughts = %q, want %q; output=%s", got, tc.want, output)
+			}
+		})
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ImageContent(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-3-5-sonnet-20240620",

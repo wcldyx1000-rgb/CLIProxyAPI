@@ -945,6 +945,17 @@ func convertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
 			}
 		}
+		// Without thinking.display the summary framework leaves visibility unset,
+		// which keeps each Claude model's own display default. Gemini targets have
+		// no such default and disagree on the wire: gemini-3-flash returns thoughts
+		// without includeThoughts, gemini-3.8-flash returns none. Request them so
+		// active thinking is visible on every Gemini target, as it is for Claude
+		// targets here. An explicit display still overrides this afterwards.
+		if gjson.GetBytes(out, "request.generationConfig.thinkingConfig").Exists() &&
+			!t.Get("display").Exists() &&
+			sigcompat.SignatureProviderFromModelName(modelName) == sigcompat.SignatureProviderGemini {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+		}
 	}
 	if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() && v.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.temperature", v.Num)
