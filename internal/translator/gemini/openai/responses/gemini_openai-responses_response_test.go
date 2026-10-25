@@ -10,6 +10,17 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func containsResponsesEvent(t *testing.T, chunks [][]byte, want string) bool {
+	t.Helper()
+
+	for _, chunk := range chunks {
+		if event, _ := parseSSEEvent(t, chunk); event == want {
+			return true
+		}
+	}
+	return false
+}
+
 func parseSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
 	t.Helper()
 
@@ -775,8 +786,12 @@ func TestConvertGeminiResponseToOpenAIResponses_VisibleSignatureCompletesActiveR
 	}
 	var param any
 	var out [][]byte
-	for _, line := range in {
-		out = append(out, ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param)...)
+	for i, line := range in {
+		chunks := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param)
+		if i == 0 && !containsResponsesEvent(t, chunks, "response.reasoning_summary_text.delta") {
+			t.Fatal("unsigned thought text must stream before its signature arrives")
+		}
+		out = append(out, chunks...)
 	}
 	var doneTypes []string
 	var addedID, addedSignature, doneID, doneSignature string
@@ -798,12 +813,14 @@ func TestConvertGeminiResponseToOpenAIResponses_VisibleSignatureCompletesActiveR
 	if got := strings.Join(doneTypes, ","); got != "reasoning,message" {
 		t.Fatalf("done item order = %q, want reasoning,message", got)
 	}
-	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, addedSignature) != testResponsesGeminiThoughtSignature || doneSignature != addedSignature {
-		t.Fatalf("reasoning item changed between added and done: added=(%q,%q) done=(%q,%q)", addedID, addedSignature, doneID, doneSignature)
+	// The item opened before the signature was known, so only done carries it;
+	// clients take the replayable item from output_item.done.
+	if addedID == "" || addedID != doneID || addedSignature != "" || decodedResponsesCarrierSignature(t, doneSignature) != testResponsesGeminiThoughtSignature {
+		t.Fatalf("reasoning item malformed between added and done: added=(%q,%q) done=(%q,%q)", addedID, addedSignature, doneID, doneSignature)
 	}
 }
 
-func TestConvertGeminiResponseToOpenAIResponses_LateThoughtSignatureIsImmutable(t *testing.T) {
+func TestConvertGeminiResponseToOpenAIResponses_LateThoughtSignatureLandsInDone(t *testing.T) {
 	signature := differentResponsesGeminiThoughtSignature(t)
 	in := []string{
 		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"one","thought":true}]}}],"responseId":"late-thought-signature"}}`,
@@ -812,8 +829,12 @@ func TestConvertGeminiResponseToOpenAIResponses_LateThoughtSignatureIsImmutable(
 	}
 	var param any
 	var addedID, addedSignature, doneID, doneSignature, doneText string
-	for _, line := range in {
-		for _, chunk := range ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param) {
+	for i, line := range in {
+		chunks := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(line), &param)
+		if i == 0 && !containsResponsesEvent(t, chunks, "response.reasoning_summary_text.delta") {
+			t.Fatal("first thought text must stream before the late signature arrives")
+		}
+		for _, chunk := range chunks {
 			event, data := parseSSEEvent(t, chunk)
 			switch event {
 			case "response.output_item.added":
@@ -830,15 +851,15 @@ func TestConvertGeminiResponseToOpenAIResponses_LateThoughtSignatureIsImmutable(
 			}
 		}
 	}
-	if addedID == "" || addedID != doneID || decodedResponsesCarrierSignature(t, addedSignature) != signature || doneSignature != addedSignature || doneText != "onetwo" {
+	if addedID == "" || addedID != doneID || addedSignature != "" || decodedResponsesCarrierSignature(t, doneSignature) != signature || doneText != "onetwo" {
 		t.Fatalf("late thought signature replay malformed: added=(%q,%q) done=(%q,%q,%q)", addedID, addedSignature, doneID, doneSignature, doneText)
 	}
 }
 
 func TestConvertGeminiResponseToOpenAIResponses_DoneFinalizesStartedStreamExactlyOnce(t *testing.T) {
 	var param any
-	ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"unsigned thought","thought":true}]}}],"responseId":"done-finalize"}}`), &param)
-	out := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte("[DONE]"), &param)
+	out := ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte(`data: {"response":{"candidates":[{"content":{"parts":[{"text":"unsigned thought","thought":true}]}}],"responseId":"done-finalize"}}`), &param)
+	out = append(out, ConvertGeminiResponseToOpenAIResponses(context.Background(), "gemini-3.6-flash-high", nil, nil, []byte("[DONE]"), &param)...)
 
 	var deltas []string
 	outputDoneCount := 0

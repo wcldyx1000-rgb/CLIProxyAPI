@@ -1046,7 +1046,12 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 						st.ReasoningPendingDeltas = append(st.ReasoningPendingDeltas, t.String())
 					}
 				}
-				if !st.ReasoningOpened && st.ReasoningEnc != "" {
+				// Open the reasoning item as soon as it has text so summary deltas
+				// stream while the model thinks. Claude sends its signature only at
+				// the end of the thinking block; waiting for it held every delta
+				// back until the answer started. A late signature still lands in
+				// the item's output_item.done event.
+				if !st.ReasoningOpened {
 					openReasoning()
 				}
 				return true
