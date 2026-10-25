@@ -6,7 +6,8 @@
 
 - **已验证**：官方与本项目都测过，结果一致。
 - **已修复**：测出差异，已修改并复测一致。
-- **未验证**：还没有对比，或只有间接线索。
+- **有差异**：测出差异，没有修改（原因写在对应位置）。
+- **待验证**：还没有对比，或只有间接线索。
 
 ## 1. 对比方法
 
@@ -72,16 +73,73 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 实测（同一提示词，连续 6 次 `/v1/responses` 流式请求，间隔 5 秒）：修复前约 1 到 2 次复用，修复后除第一次外全部复用（5/5）。
 
-## 3. 未验证的项目
+### 2.3 请求外层（桌面客户端解密抓取，2026-10-25）
 
-| 项目 | 目前掌握的线索 | 怎么验证 |
-| --- | --- | --- |
-| 官方模型请求使用的 transport 参数 | 见第 3.2 节。`newFastpushTransport` 的参数已读出，但抓取显示模型接口没有协商 h2，它不像是模型请求的 transport；模型请求实际用哪个 transport 还没找到 | 在官方进程上做运行时观测，确认模型请求实际使用的 transport |
-| 空闲连接的保活 | 见第 3.3 节：客户端每 60 秒在模型连接上发一个约 630 字节的请求，连接因此一直不空闲；这个请求的内容未知（不解密） | 在可解密的环境下确认这个周期请求是什么 |
-| 一次请求的并发连接数 | 见第 3.3 节：两边在“没有可用空闲连接”时都会多出一个只握手不承载请求的连接；本项目冷启动时还会和生成请求同时发一个 `credits_query` | 已基本澄清，`credits_query` 是否对应客户端的某个调用待验证 |
-| 请求头、请求体字段、顺序 | 未对比 | 在可解密的环境下对比两边的请求 |
-| 超时与重试策略 | 见第 3.4 节：本项目一侧已用假上游实测，传输层错误的立即重试已修复；客户端一侧只有静态分析，退避基数未知 | 在客户端上触发错误做运行时观测 |
-| 单次调用耗时：约 4.5 秒的固定耗时与偶发 25 到 31 秒的长尾 | 见下文第 3.1 节 | 用相同的输入内容和相同的思考量重测 |
+**对比范围。** 对话内容、系统提示和工具定义由使用本项目的客户端决定，本来就不会、也不应该与桌面端相同，不在对比范围内。对比的是请求的“外层”：请求路径和查询参数、请求头（名称、取值格式、顺序）、请求体的包装字段及 JSON 字段顺序。
+
+**取证方式。** 桌面端（Windows 版 2.26.0）经本地代理 `docs/tools/shape_proxy.js` 运行。代理用临时根证书只解密 `daily-cloudcode-pa.googleapis.com` 和 `aicode.googleapis.com`，记录请求后在本地返回响应，**请求不转发给 Google**；其他主机原样转发隧道、不解密。启动阶段的查询接口（`loadCodeAssist`、`fetchAvailableModels` 等）由代理返回本地编造的最小响应，字段名取自 `language_server.exe` 里的 protobuf 描述符（`docs/tools/proto_fields.js`）；生成请求返回错误（观察重试）或一条编造的成功回复（继续下一轮）。本项目一侧用第 4 节的假上游记录。两边用同一套规则（`docs/tools/req_shape.js`）把请求转成“形状”：令牌只记长度，对话内容只记长度和字符类别。临时根证书测完已从用户证书库删除，私钥已删除。
+
+**抓到的样本**：Gemini 模型新对话 1 轮（503）、新对话 3 轮（编造的成功回复）、Claude 模型新对话 1 轮，以及对 503 的完整重试过程。
+
+| 项目 | 客户端 2.26.0 | 本项目修复前 | 本项目修复后 | 状态 |
+| --- | --- | --- | --- | --- |
+| 生成请求的路径和查询 | `POST /v1internal:streamGenerateContent?alt=sse` | 相同 | 相同 | 已验证 |
+| 生成请求的请求头 | `Host`、`User-Agent`、`Transfer-Encoding: chunked`、`Authorization`、`Content-Type`、`Accept-Encoding: gzip`，依此顺序 | 用 `Content-Length` 代替 `Transfer-Encoding`，其余相同 | 与客户端相同 | 已修复 |
+| `loadCodeAssist` 的请求头和请求体 | 用 `Content-Length`；请求体 `{"metadata":{"ideType":…}}` | 相同 | 相同 | 已验证 |
+| `User-Agent` 的 `cl` | `antigravity/hub/2.26.0 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)` | 2.26.0 不带 `cl`；启动后第一个 `fetchAvailableModels` 用的是后备版本 2.24.0 | 2.26.0 带 `cl=1005016104`；模型目录探测先等首次版本拉取（最多 10 秒） | 已修复 |
+| 顶层字段顺序 | `project`、`requestId`、`request`、`model`、`userAgent`、`requestType` | `requestId` 在最后 | 与客户端相同 | 已修复 |
+| `requestId` | `agent/<cascade_id>/<毫秒时间戳>/<trajectory_id>/<step>` | `agent-<uuid>` | 与客户端格式相同 | 已修复（`step` 的取法见下） |
+| `request` 内字段顺序 | `contents`、`systemInstruction`、`tools`、`labels`、`generationConfig`、`sessionId` | 没有 `labels`，其余顺序取决于下游请求 | 与客户端相同 | 已修复（`toolConfig` 的位置没有观测到，暂放在 `tools` 之后） |
+| `request.labels` | 见下文，键按名称排序 | 没有 | 与客户端相同 | 已修复（部分取值是推断，见下） |
+| `generationConfig` | 抓取中为 `maxOutputTokens` 加 `thinkingConfig{includeThoughts, thinkingBudget}` | Gemini 模型不发 `maxOutputTokens`；`thinkingConfig` 用 `thinkingLevel` | 未改 | 待验证：客户端按服务端模型目录填这两项，抓取时目录是编造的，结果不代表真实情况 |
+| Claude 模型的 `toolConfig` | 抓取中没有 | 设 `functionCallingConfig.mode=VALIDATED` | 未改 | 待验证（原因同上） |
+| 工具参数的 `type` 写法 | 大写，如 `OBJECT`、`STRING` | 原样转发下游的小写写法 | 未改 | 有差异：取值来自下游的工具定义，属于内容层 |
+
+关于 `User-Agent`：本项目固定报 `os_type=darwin; arch=arm64`，即模拟 mac 版客户端，这是原有的选择，本次不变。为确认 mac 版也用同一个 `cl`，下载了官方 2.26.0 darwin-arm 安装包（SHA-512 与更新清单一致），其中的 `language_server` 和 `webm_encoder` 都含 `1005016104`。后备版本同时改为 2.26.0。
+
+**`requestId` 与 `labels` 的规律**（3 轮对话、每轮无工具调用时实测）：
+
+- `step` 等于 `request.contents` 的条数（第 1、2、3 轮分别为 1、3、5）；`labels.last_step_index` 等于 `step − 1`。
+- `cascade_id`、`trajectory_id` 是两个不同的随机 UUID（版本 4），同一对话内不变；`root_cascade_id` 等于 `cascade_id`。
+- `labels.request_id` 为 `<trajectory_id>-<轮次>`，轮次从 0 开始。
+- 从第二轮起多一个 `last_execution_id`（UUID），与其他 ID 看不出关系。
+- `model_enum` 为模型目录里该模型的 `model` 字段（如 `MODEL_PLACEHOLDER_M20`）。
+- `used_claude`、`used_claude_conservative`、`used_non_gemini_model`：Gemini 模型三个都是 `"false"`，Claude 模型三个都是 `"true"`。
+
+本项目的做法（`internal/runtime/executor/antigravity_request_envelope.go`）：本项目没有客户端的会话状态，所以 `cascade_id`、`trajectory_id`、`last_execution_id` 由 `project` 和 `sessionId` 经 SHA-256 推导，并按版本 4 UUID 的格式输出，同一对话的多轮和重试保持不变，不需要保存状态。下面几点是推断，没有实测依据：
+
+- 有工具调用的轮次，`step` 仍取 `contents` 的条数；只由 `functionResponse` 组成的用户消息不算新的一轮。
+- 其他模型（既非 Gemini 也非 Claude）的 `used_non_gemini_model` 取 `"true"`、两个 `used_claude*` 取 `"false"`。
+- 模型目录尚未报告 `model_enum` 时省略这个键。
+- 本项目的 `sessionId` 在下游没有提供时由第一条用户消息的哈希生成，所以两段开头相同的对话会得到相同的 ID；客户端每段对话都是新的随机 ID。
+
+**真实服务端验证**：用修复后的构建另起一个实例，向真实服务各发一条请求：Gemini 多轮对话（带系统提示）返回 200，3.96 秒；Claude 带工具调用返回 200，2.28 秒，正确产生工具调用。
+
+**客户端的其他请求**（本项目都没有，未改）：
+
+- 启动时还会调用 `listExperiments`、`fetchUserInfo`、`retrieveUserQuotaSummary`、`/v1internal/cascadeNuxes`、`/v1internal/agentPlugins`、`/v1internal/buildWithGooglePlugins`，对话开始时调用 `writeTrajectoryAcls`。
+- 第 3.3 节里每 60 秒一次、约 630 字节的请求是 **`listExperiments`**（实验开关轮询；形状日志算出的线上大小约 614 字节，间隔正好 60.0 秒）。此外 `cascadeNuxes` 每 120 秒一次，`loadCodeAssist` 和 `fetchAvailableModels` 约每 6 分钟一次。
+- 每段新对话开始时，客户端另发 `requestType: checkpoint` 的生成请求（`requestId` 为 `checkpoint/<uuid>`，没有 `labels`），这是客户端自身的功能。
+
+这些请求承载的是客户端自己的功能。本项目照着发，等于凭空制造请求，而且在大凭据池下会成倍增加请求量（参见第 3.3 节 #5494 的教训），所以不跟。
+
+## 3. 尚未完成的部分
+
+**结论先行：连接层和生成请求的外层已对齐，有实测依据，修复后的格式也经过真实服务验证。但仍有下表中的差异或未验证项，不能说本项目与官方客户端完全一致。**
+
+按对“像不像官方客户端”的影响排序：
+
+| 优先级 | 项目 | 目前状况 | 怎么完成 |
+| --- | --- | --- | --- |
+| 1 | `generationConfig`（`maxOutputTokens`、思考参数）和 Claude 的 `toolConfig` | 客户端按服务端模型目录填写，抓取时目录是编造的（第 2.3 节） | 本项目自己会拉取真实模型目录，把它交给不转发代理当作响应，再抓一次 |
+| 2 | 有工具调用时的 `step` 和 `labels` | 只测了无工具调用的轮次，工具调用轮次的取法是推断 | 让不转发代理编造一个带 `functionCall` 的回复，再抓一次 |
+| 3 | 客户端对 503 在同一凭据上退避重试，本项目单凭据时不重试 | 已实测客户端的节奏（第 3.4 节） | 是否要跟需要权衡，暂不改 |
+| 4 | `aicode.googleapis.com` | 本次抓取期间没有出现对它的请求，用途未知 | 待观察 |
+| 5 | `credits_query` 对应的客户端调用 | 本次抓取中客户端调用的是 `retrieveUserQuotaSummary`，与本项目的积分查询是否对应还没有比较 | 对比两边的请求体 |
+| 6 | 耗时对比 | 只有 `agy` 与本项目的数据（第 3.1 节）。两边请求体本来就不同，耗时主要由模型思考决定，对判断对齐程度帮助有限 | 暂不做 |
+| 7 | 模型请求实际使用的传输参数 | 静态分析没有找到调用方（第 3.2 节） | 暂不做 |
+
+已完成、有实测依据的项目见第 2 节。
 
 ### 3.1 耗时对比（初步，官方一侧来自 `agy`，尚未在桌面客户端上重测）
 
@@ -118,14 +176,14 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 关键观察：
 
 - **空闲连接由上游一侧关闭**：本项目两个空闲连接分别在空闲 56.5 秒、58.5 秒时被上游一侧先关闭（2 个样本）。上游一侧包括 VPN，所以不能断定是 Google 服务端关的。代码注释里写的“GFE 240 秒空闲断开”与这个观测不一致，这里只记录观测，不改注释的依据。
-- **客户端用周期请求保活**：客户端每隔整 60 秒在模型连接上发一个约 630 字节的请求，响应几 KB，连接因此持续可用。请求内容未知。本项目没有这种周期请求。
+- **客户端的周期请求顺带保活**：客户端每隔整 60 秒在模型连接上发一个约 630 字节的请求，响应几 KB，连接因此持续可用。解密抓取（第 2.3 节）确认这是实验开关轮询 `listExperiments`，不是专门的保活请求。本项目没有这种周期请求。
 - **默认短连接的来历**：上游在 #5494 中发现，大凭据池轮换时每个凭据各自保留 10 分钟的空闲连接，一小时内积压数千条，因此在 d5397905 中把默认改成短连接。这是面向大凭据池的取舍；对单用户、单凭据的使用方式，启用连接池更接近客户端。
 
 结论：在启用连接池、空闲时间短于上游关闭时间的情况下，本项目的连接行为与客户端一致；默认配置下每个请求都新建连接，与客户端不同。`idle-conn-timeout` 设得比上游关闭时间（本次约 56 秒）更长没有收益，因为连接会先被上游关掉。
 
-### 3.4 模型请求的重试（客户端静态分析与本项目代码对比）
+### 3.4 模型请求的重试（客户端静态分析与实测，本项目代码与实测）
 
-客户端一侧来自反编译，没有在运行时触发过错误来验证；字段含义是按代码结构推断的，下表标注了把握程度。
+下面“哪些错误会重试”一表的客户端一侧来自反编译，字段含义是按代码结构推断的，表中标注了把握程度。客户端对 503 的重试节奏已经实测，见本节末尾。
 
 **哪些错误会重试**
 
@@ -167,11 +225,21 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
 
 修复（`sdk/cliproxy/auth/antigravity_transient_retry.go`）：只对 Antigravity、只对传输层瞬时错误，下一轮前等待“窗口的一半加上一半以内的随机值”，窗口依次为 1、2、4 秒，之后保持 4 秒；调度层原有的等待抖动最多再加 25%，所以最长等待是 5 秒，与客户端上限相同。基数 1 秒是本项目的选择，因为客户端的基数读不出来。`max-retry-interval` 设为 0 时仍然立即重试。其他提供方的行为不变。回归测试：`TestShouldRetryAfterErrorBacksOffTransientErrorsOnlyForAntigravity`。
 
-**仍有差异、未改动的**：客户端会对 503 等错误在同一凭据上退避重试，本项目单凭据时不重试；本项目对 429（短延迟）的等待约 10 秒，比客户端更保守。这两处本项目更少发请求，暂不改动。
+**客户端对 503 的实测重试**（第 2.3 节的不转发代理对每个生成请求都返回 503）：
+
+| 请求 | 次数 | 相邻两次的间隔（秒） |
+| --- | --- | --- |
+| 对话请求（`requestType: agent`），第 1 次运行 | 5 次后代理被停止 | 4.0、7.1、15.2、20.2 |
+| 对话请求，第 2 次运行 | 7 次后代理被停止 | 4.0、6.0、15.0、30.6、60.7、119.0 |
+| `checkpoint` 请求，两次运行 | 3 次后停止 | 1.0、1.6 到 1.7 |
+
+对话请求大致每次加倍，从约 4 秒开始，测到 119 秒时还在重试，上限没有测到；每次重试的 `requestId` 末段 `step` 和 `labels.last_step_index` 都加 1。这与静态分析的 `SleepForMidStreamRetry`（上限 5 秒）不同，那个函数处理的是流中途的重试，不是开始前收到 503 的情况。
+
+**仍有差异、未改动的**：客户端对 503 在同一凭据上长时间退避重试，本项目单凭据时不重试，把错误交还给下游客户端；本项目对 429（短延迟）的等待约 10 秒，比客户端更保守。这两处本项目发的请求更少，暂不改动。
 
 ## 4. 复现与回归
 
-- 单元测试：`go test ./internal/runtime/executor/ ./sdk/cliproxy/`，其中 `TestNewAntigravityCatalogHTTPClientOmitsALPN` 保证非生成请求不发 ALPN。
+- 单元测试：`go test ./internal/runtime/executor/ ./sdk/cliproxy/ ./internal/misc/`，其中 `TestNewAntigravityCatalogHTTPClientOmitsALPN` 保证非生成请求不发 ALPN，`antigravity_request_envelope_test.go` 固定第 2.3 节的请求外层，`antigravity_version_wait_test.go` 覆盖启动时的版本等待。
 - 抓取回归：每次改动 Antigravity 的网络层后，重新跑第 1.1 节的抓取，确认 `daily-cloudcode-pa.googleapis.com` 的所有连接都是 `NO-ALPN-EXTENSION`。
 - 连接时间线（第 3.3 节）：`node docs/tools/timing_proxy.js timeline.log` 启动代理（端口 18081），被测程序带 `HTTPS_PROXY=http://127.0.0.1:18081` 运行，结束后用 `node docs/tools/timeline_summary.js timeline.log` 汇总。
 - 重试实测（第 3.4 节），不访问真实服务：
@@ -179,6 +247,20 @@ HTTPS_PROXY=http://127.0.0.1:18080 NO_PROXY=127.0.0.1,localhost ./cpa -config co
   2. `node docs/tools/fake_upstream.js 18090 up.log <模式> <输出目录>/ids.json`：模式为 `403`、`500`、`503`、`429rate`、`429quota`、`eof`。
   3. 用生成的配置启动本项目（不要设置 `HTTPS_PROXY`），向 8319 端口发一个请求，再看 `up.log` 里生成请求的次数和间隔。
   4. Windows 上 `node` 可能经 Volta 启动器包了一层，结束进程时要按命令行找到真正的 `node` 进程，否则端口会被残留进程占住，后面的结果全部作废。
+- 请求外层对比（第 2.3 节）：
+  1. 生成有效期 2 天的临时根证书和服务器证书（扩展配置见 `docs/tools/shape_leaf.ext`）：
+     ```bash
+     openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 2 -subj "/CN=CPA Alignment Test CA (temporary, delete after test)"
+     openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=daily-cloudcode-pa.googleapis.com"
+     openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out leaf.pem -days 2 -extfile docs/tools/shape_leaf.ext
+     openssl x509 -in ca.pem -outform der -out ca.cer
+     ```
+  2. 由本人把根证书加入当前用户的信任列表：`certutil -user -addstore Root ca.cer`（Windows 会弹出确认框）。这一步削弱本机的 TLS 校验，测完必须删除。
+  3. `node docs/tools/shape_proxy.js client.log leaf.pem leaf.key 503`（或 `200`），监听 127.0.0.1:18082。
+  4. 带 `HTTPS_PROXY=http://127.0.0.1:18082`、`NO_PROXY=127.0.0.1,localhost` 和 `--remote-debugging-port=9333 --remote-allow-origins=*` 启动桌面端；`node docs/tools/send.js "<消息>" new` 在后台发消息，`node docs/tools/click_text.js "<文字>"...` 点击界面（例如切换模型）。
+  5. 汇总：`node docs/tools/print_shapes.js client.log`（全部请求）、`node docs/tools/gen_summary.js client.log`（生成请求的关键字段）、`node docs/tools/retry_gaps.js client.log`（重试间隔）。本项目一侧用上面的假上游，日志格式相同。
+  6. 收尾：`certutil -user -delstore Root <根证书 SHA-1 指纹>`，删除 `ca.key`、`leaf.key`，再用 `certutil -user -store Root <指纹>` 确认已找不到。
+  7. 编造响应所需的字段名可从客户端二进制里读：`node docs/tools/proto_fields.js language_server.exe FetchAvailableModelsResponse`；枚举名用 `node docs/tools/enum_scan.js language_server.exe 'MODEL_PLACEHOLDER_M[0-9]+'`。
 
 ## 5. 范围说明
 

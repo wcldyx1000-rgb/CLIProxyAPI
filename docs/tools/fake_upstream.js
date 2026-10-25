@@ -3,6 +3,7 @@
 // 模式: 403 | 500 | 503 | 429rate（RetryInfo 2s）| 429quota（QUOTA_EXHAUSTED，RetryInfo 3600s）| eof（发完响应头后断开）
 const http = require('http');
 const fs = require('fs');
+const { shapeRequest } = require('./req_shape');
 const [port, logPath, mode, idsPath] = process.argv.slice(2);
 const ids = JSON.parse(fs.readFileSync(idsPath, 'utf8'));
 const t0 = Date.now();
@@ -25,15 +26,16 @@ const failures = {
 };
 
 http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (d) => { body += d; });
+  const chunks = [];
+  req.on('data', (d) => chunks.push(d));
   req.on('end', () => {
     const path = req.url.split('?')[0];
     const generate = /:(stream)?[gG]enerateContent$/.test(path);
-    log({ path, generate, bytes: body.length });
+    // 记录请求形状（规则见 req_shape.js），与桌面端解密代理的记录方式相同，便于逐字段对比
+    log({ generate, ...shapeRequest(req, Buffer.concat(chunks)) });
     if (path.endsWith(':fetchAvailableModels')) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ models: Object.fromEntries(ids.map((id) => [id, {}])) }));
+      res.end(JSON.stringify({ models: Object.fromEntries(ids.map((id, i) => [id, { model: `MODEL_PLACEHOLDER_M${i}` }])) }));
       return;
     }
     if (!generate) {

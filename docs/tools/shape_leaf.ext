@@ -1,0 +1,4 @@
+subjectAltName=DNS:daily-cloudcode-pa.googleapis.com,DNS:aicode.googleapis.com
+basicConstraints=CA:FALSE
+extendedKeyUsage=serverAuth
+keyUsage=critical,digitalSignature,keyEncipherment
