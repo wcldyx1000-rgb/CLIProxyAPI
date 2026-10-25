@@ -79,6 +79,7 @@ func nextAntigravityFailure(previous antigravityFailureState, now time.Time, ran
 var (
 	antigravityNowFunc          = time.Now
 	antigravityModelUserAgent   = misc.AntigravityUserAgent
+	antigravityVersionWaitMax   = 10 * time.Second // matches the version fetch timeout
 	antigravityCapabilityMu     sync.RWMutex
 	antigravityCapabilityCache  = make(map[string]antigravityCapabilityCacheEntry)
 	antigravityAuthFailureCache = make(map[string]antigravityFailureState)
@@ -350,6 +351,10 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		ctx = context.Background()
 	}
 	baseURLs, proxyURL := antigravityModelBaseURLs(auth), s.antigravityModelFetchProxyURL(auth)
+	// Startup probes run before the first version fetch completes; waiting keeps
+	// them from reporting the fallback version while later requests report the
+	// fetched one.
+	misc.WaitForAntigravityVersion(ctx, antigravityVersionWaitMax)
 	userAgent := antigravityModelUserAgent()
 	cacheKey := antigravityCapabilityKeyForRoute(auth, baseURLs[0], proxyURL, userAgent)
 	accessToken, _ := auth.Metadata["access_token"].(string)
@@ -507,6 +512,7 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	if !ok {
 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
 	}
+	executor.RecordAntigravityModelEnums(parseAntigravityModelEnums(data))
 	return hints, antigravityProbeStatusSuccess
 }
 
@@ -589,6 +595,26 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 		}
 	}
 	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, ModelIDs: modelIDs}, true
+}
+
+// parseAntigravityModelEnums maps each catalog model ID to the enum name in its
+// "model" field, which agent requests report as labels.model_enum.
+func parseAntigravityModelEnums(body []byte) map[string]string {
+	var parsed struct {
+		Models map[string]struct {
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	enums := make(map[string]string, len(parsed.Models))
+	for id, details := range parsed.Models {
+		if modelID := normalizeAntigravityFetchedModelID(id); modelID != "" && details.Model != "" {
+			enums[modelID] = details.Model
+		}
+	}
+	return enums
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {

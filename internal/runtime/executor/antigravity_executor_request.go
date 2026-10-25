@@ -88,7 +88,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 
 		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
-		payloadStrBytes = helps.FinalizePayload(ctx, payloadStrBytes)
+		payloadStrBytes = orderAntigravityPayload(helps.FinalizePayload(ctx, payloadStrBytes))
 		bodyReader = bytes.NewReader(payloadStrBytes)
 		if e.cfg != nil && e.cfg.RequestLog {
 			payloadLog = append([]byte(nil), payloadStrBytes...)
@@ -101,7 +101,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		}
 
 		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
-		payload = helps.FinalizePayload(ctx, payload)
+		payload = orderAntigravityPayload(helps.FinalizePayload(ctx, payload))
 		bodyReader = bytes.NewReader(payload)
 		if e.cfg != nil && e.cfg.RequestLog {
 			payloadLog = append([]byte(nil), payload...)
@@ -125,6 +125,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	if errReq != nil {
 		return nil, errReq
 	}
+	// The desktop client sends generate bodies with Transfer-Encoding: chunked
+	// rather than Content-Length. GetBody stays set, so the body can still be
+	// replayed when a reused connection turns out to be dead.
+	httpReq.ContentLength = -1
 	// Deliberately no httpReq.Close: the native Antigravity client omits the
 	// Connection header and keeps its HTTP/1.1 connections alive, so forcing
 	// "Connection: close" would both deviate from that fingerprint and defeat the
@@ -674,7 +678,6 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string, der
 	if isImageModel {
 		template, _ = sjson.SetBytes(template, "requestId", generateImageGenRequestID())
 	} else if reqType != "web_search" {
-		template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
 		sessionID := strings.TrimSpace(gjson.GetBytes(template, "request.sessionId").String())
 		if sessionID == "" && len(derivedSessionIDs) > 0 {
 			sessionID = strings.TrimSpace(derivedSessionIDs[0])
@@ -683,6 +686,11 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string, der
 			sessionID = generateStableSessionID(payload)
 		}
 		template, _ = sjson.SetBytes(template, "request.sessionId", sessionID)
+		if reqType == "agent" {
+			template = applyAntigravityAgentEnvelope(template, modelName, projectID, sessionID, time.Now())
+		} else {
+			template, _ = sjson.SetBytes(template, "requestId", generateRequestID())
+		}
 	}
 
 	template, _ = sjson.DeleteBytes(template, "request.safetySettings")
