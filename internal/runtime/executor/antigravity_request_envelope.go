@@ -63,8 +63,7 @@ func antigravityModelEnum(modelName string) string {
 // given parts, matching the format of the client's random conversation IDs.
 func antigravityDerivedUUID(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-	var id uuid.UUID
-	copy(id[:], sum[:16])
+	id := uuid.UUID(sum[:16])
 	id[6] = (id[6] & 0x0f) | 0x40
 	id[8] = (id[8] & 0x3f) | 0x80
 	return id.String()
